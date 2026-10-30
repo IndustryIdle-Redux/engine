@@ -1,45 +1,18 @@
 /**
- * Asset loading — replaces Cocos's `cc.resources.load` / `loadDir` / `cc.SpriteAtlas`.
- *
- * ### Differences from the original implementation
- * The original loads a **build-time generated AutoAtlas** through Cocos's Asset Bundle
- * (214 building images → packed into 1 701×1024 PNG at build time, indexed by SpriteFrame name at runtime).
- * Here we use **standard Web assets** instead:
- *  - images go through `<img>` / `createImageBitmap` (native browser caching)
- *  - an atlas is just "one PNG + a set of UV rects"; the rects come from a manifest JSON or from code
- *
- * Upside: free of Cocos's UUID/`.meta` system, assets can be served directly by any CDN/static server.
- *
- * This module only depends on `fetch` / `Image` / `createImageBitmap`, so it runs in the browser and in
- * modern Node (which has fetch) — the loading logic itself is testable (inject a fetch stub).
- *
- * ### Backend-agnostic textures
- * Textures are created through the `RenderDevice` seam (`device.createTexture(image, w, h, options)`),
- * **not** through `Texture.fromImage(gl, …)`. That GL-specific path used to stop the "backend agnostic
- * above `Renderer2D`" rule right at resource loading: every texture would have been a WebGL2 texture even
- * when the WebGPU backend was active. `Loader` therefore now takes a `RenderDevice`, exactly like
- * `Renderer2D.createTexture`.
+ * Asset loading: fetch, decode and build textures through the backend-agnostic
+ * `RenderDevice` seam. There is no dependency graph or refcounting; an atlas is just
+ * one image plus a manifest of UV rects.
  */
 
 import type { RenderDevice, RenderTexture, TextureOptions } from "./RenderDevice";
 
 /**
- * Atlas sub-rect → UV.
+ * Atlas sub-rect to UV.
  *
- * ### ⚠️ This is the easiest place in the project to get wrong, and the hardest to notice once wrong
- * `Texture.fromImage` uploads with `UNPACK_FLIP_Y_WEBGL = true`,
- * and **what it flips is the whole atlas**: inside the GPU the relation between `v` and the image row is
- *   `image row = (1 - v) · H`
- * while in `SpriteBatch`'s `v_uv = uvPos + q · uvSize`, `q.y = 1` is the **top of the quad**.
- *
- * So for the "top of the quad" to show the sprite's **top row** `y`, we need:
- *   top v = uvPos.y + uvSize.y = 1 - y/H
- *   bottom v = uvPos.y          = 1 - (y+h)/H
- * i.e. `uvPos.y = 1 - (y+h)/H`, not the intuitive `y/H`.
- *
- * The intuitive `y/H` **flips every sprite vertically** and samples the neighboring region, showing up as "sprites shattered into pieces".
- * Note: when testing orientation with the **whole texture** (uvPos=0, uvSize=1) both formulas give 0,
- * so **this bug cannot be caught that way** — you must test with a real, non-full sub-rect.
+ * Textures are uploaded flipped vertically (image row = (1 - v) * H), while q.y = 1 is
+ * the top of the quad. So the top of the quad must sample the rect's top row:
+ *   top v = 1 - y/H, bottom v = 1 - (y + h)/H
+ * which gives `v0 = 1 - (y + h)/H`, not the intuitive `y/H`.
  */
 export function atlasRectToUV(
     rect: { x: number; y: number; width: number; height: number },
@@ -48,7 +21,6 @@ export function atlasRectToUV(
 ): { u0: number; v0: number; du: number; dv: number } {
     return {
         u0: rect.x / atlasWidth,
-        // note: NOT rect.y / atlasHeight (see the derivation above)
         v0: 1 - (rect.y + rect.height) / atlasHeight,
         du: rect.width / atlasWidth,
         dv: rect.height / atlasHeight,
@@ -57,7 +29,7 @@ export function atlasRectToUV(
 
 /** A single rect in the atlas manifest (pixels) */
 export interface AtlasRect {
-    /** sprite name (matches the original's SpriteFrame name, e.g. a building key) */
+    /** Sprite name (e.g. a building key) */
     name: string;
     x: number;
     y: number;
@@ -65,18 +37,17 @@ export interface AtlasRect {
     height: number;
 }
 
-/** Atlas manifest file format (our own definition, replacing Cocos's AutoAtlas) */
+/** Atlas manifest: image path relative to the asset root plus sprite rects. */
 export interface AtlasManifest {
-    /** image path relative to the asset root directory */
     image: string;
-    /** total atlas size (pixels) */
+    /** Total atlas size (pixels) */
     width: number;
     height: number;
-    /** sprite rects; the coordinate origin is the image's top-left corner */
+    /** Sprite rects, origin at the image's top-left corner */
     rects: AtlasRect[];
 }
 
-/** A loaded atlas: texture + name → UV mapping */
+/** A loaded atlas: texture + name to UV mapping. */
 export class Atlas {
     public readonly texture: RenderTexture;
     public readonly width: number;
@@ -89,7 +60,8 @@ export class Atlas {
         this.width = manifest.width;
         this.height = manifest.height;
         for (const r of manifest.rects) {
-            // Always go through atlasRectToUV, so nobody writes their own copy (that is exactly how V got flipped once)
+            // keep the first entry for a name; Loader.atlas warns about duplicates
+            if (this.uvByName.has(r.name)) continue;
             this.uvByName.set(r.name, atlasRectToUV(r, manifest.width, manifest.height));
             this.sizeByName.set(r.name, { width: r.width, height: r.height });
         }
@@ -111,11 +83,7 @@ export class Atlas {
         return this.uvByName.size;
     }
 
-    /**
-     * Convenience: draw one sprite into the batch (looks up UV and size automatically).
-     *
-     * Returns false when it is `null` (sprite missing), so callers can fall back instead of throwing.
-     */
+    /** Draw one sprite into the batch; returns false when the sprite is missing. */
     public draw(
         name: string,
         push: (texture: RenderTexture, call: { x: number; y: number; w: number; h: number; ax?: number; ay?: number; u0: number; v0: number; du: number; dv: number }) => void,
@@ -144,20 +112,15 @@ export class Atlas {
 }
 
 export interface LoaderOptions {
-    /** asset root path (defaults to the empty string, i.e. relative to the current page) */
+    /** Asset root path (defaults to the empty string, i.e. relative to the page) */
     basePath?: string;
-    /** texture filter options */
+    /** Texture filter options */
     texture?: TextureOptions;
-    /** custom fetch (for test injection) */
+    /** Custom fetch (for test injection) */
     fetchImpl?: typeof fetch;
 }
 
-/**
- * Asset loader.
- *
- * It only does "fetch bytes → decode → build texture"; no Cocos-style dependency graph and refcounting
- * (that would need the UUID system, and escaping it is the whole point).
- */
+/** Asset loader: fetch bytes, decode images and build textures/atlases. */
 export class Loader {
     private readonly basePath: string;
     private readonly textureOptions: TextureOptions;
@@ -170,37 +133,34 @@ export class Loader {
     }
 
     private url(path: string): string {
-        if (/^(https?:)?\/\//.test(path) || path.startsWith("/")) return path;
-        return `${this.basePath}${path}`;
+        if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(path) || path.startsWith("/")) return path;
+        const base = this.basePath;
+        if (!base) return path;
+        return `${base.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
     }
 
-    /** Fetch binary (for WASM / workers etc.; replaces `fetch(getResourceUrl(...))`) */
+    /** Fetch binary (WASM, workers, ...) */
     public async bytes(path: string): Promise<ArrayBuffer> {
         const res = await this.fetchImpl(this.url(path));
         if (!res.ok) throw new Error(`[loader] load failed ${path}: HTTP ${res.status}`);
         return res.arrayBuffer();
     }
 
-    /** Fetch JSON (atlas manifests, config) */
+    /** Fetch JSON */
     public async json<T>(path: string): Promise<T> {
         const res = await this.fetchImpl(this.url(path));
         if (!res.ok) throw new Error(`[loader] load failed ${path}: HTTP ${res.status}`);
         return (await res.json()) as T;
     }
 
-    /** Fetch text (replaces `cc.TextAsset`, e.g. worker scripts, CSS) */
+    /** Fetch text (worker scripts, CSS, ...) */
     public async text(path: string): Promise<string> {
         const res = await this.fetchImpl(this.url(path));
         if (!res.ok) throw new Error(`[loader] load failed ${path}: HTTP ${res.status}`);
         return res.text();
     }
 
-    /**
-     * Decode an image URL into a texture through the device seam.
-     *
-     * Prefer `createImageBitmap` (can decode off the main thread, and needs no DOM),
-     * falling back to `<img>`. Both set `crossOrigin` so CDNs work.
-     */
+    /** Decode an image URL into a texture through the device seam. */
     public async texture(device: RenderDevice, path: string): Promise<RenderTexture> {
         const url = this.url(path);
 
@@ -209,9 +169,11 @@ export class Loader {
             if (!res.ok) throw new Error(`[loader] load failed ${path}: HTTP ${res.status}`);
             const blob = await res.blob();
             const bitmap = await createImageBitmap(bitmapSource(blob));
-            const t = device.createTexture(bitmap, bitmap.width, bitmap.height, this.textureOptions);
-            bitmap.close();
-            return t;
+            try {
+                return device.createTexture(bitmap, bitmap.width, bitmap.height, this.textureOptions);
+            } finally {
+                bitmap.close();
+            }
         }
 
         return new Promise<RenderTexture>((resolve, reject) => {
@@ -225,12 +187,81 @@ export class Loader {
         });
     }
 
-    /** Load the manifest + image and assemble a usable atlas */
+    /** Load the manifest + image and assemble a validated atlas. */
     public async atlas(device: RenderDevice, manifestPath: string): Promise<Atlas> {
-        const manifest = await this.json<AtlasManifest>(manifestPath);
+        const manifest = validateAtlasManifest(await this.json<unknown>(manifestPath));
         const texture = await this.texture(device, manifest.image);
+        if (texture.width !== manifest.width || texture.height !== manifest.height) {
+            throw new Error(
+                `[loader] atlas manifest ${manifestPath}: declared ${manifest.width}x${manifest.height} ` +
+                    `but texture is ${texture.width}x${texture.height}`,
+            );
+        }
         return new Atlas(texture, manifest);
     }
+}
+
+/** Validate an untrusted manifest and drop duplicate rect names (keeping the first). */
+function validateAtlasManifest(value: unknown): AtlasManifest {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("[loader] atlas manifest must be an object");
+    }
+    const manifest = value as Record<string, unknown>;
+
+    if (typeof manifest.image !== "string" || manifest.image.trim() === "") {
+        throw new Error("[loader] atlas manifest: image must be a non-empty string");
+    }
+    const width = manifest.width;
+    const height = manifest.height;
+    if (typeof width !== "number" || !Number.isFinite(width) || width <= 0) {
+        throw new Error("[loader] atlas manifest: width must be a finite positive number");
+    }
+    if (typeof height !== "number" || !Number.isFinite(height) || height <= 0) {
+        throw new Error("[loader] atlas manifest: height must be a finite positive number");
+    }
+    if (!Array.isArray(manifest.rects)) {
+        throw new Error("[loader] atlas manifest: rects must be an array");
+    }
+
+    const rects: AtlasRect[] = [];
+    const names = new Set<string>();
+    for (let i = 0; i < manifest.rects.length; i++) {
+        const raw = manifest.rects[i] as unknown;
+        const where = `rects[${i}]`;
+        if (typeof raw !== "object" || raw === null) {
+            throw new Error(`[loader] atlas manifest: ${where} must be an object`);
+        }
+        const rect = raw as Record<string, unknown>;
+        if (typeof rect.name !== "string" || rect.name.trim() === "") {
+            throw new Error(`[loader] atlas manifest: ${where}.name must be a non-empty string`);
+        }
+        for (const field of ["x", "y", "width", "height"] as const) {
+            const v = rect[field];
+            if (typeof v !== "number" || !Number.isFinite(v)) {
+                throw new Error(`[loader] atlas manifest: ${where}.${field} must be a finite number`);
+            }
+        }
+        const x = rect.x as number;
+        const y = rect.y as number;
+        const w = rect.width as number;
+        const h = rect.height as number;
+        if (w <= 0 || h <= 0) {
+            throw new Error(`[loader] atlas manifest: ${where}.width and .height must be greater than 0`);
+        }
+        if (x < 0 || y < 0 || x + w > width || y + h > height) {
+            throw new Error(
+                `[loader] atlas manifest: ${where} "${rect.name}" is outside the ${width}x${height} atlas`,
+            );
+        }
+        if (names.has(rect.name)) {
+            console.warn(`[loader] atlas manifest: duplicate rect name "${rect.name}", keeping the first`);
+            continue;
+        }
+        names.add(rect.name);
+        rects.push({ name: rect.name, x, y, width: w, height: h });
+    }
+
+    return { image: manifest.image, width, height, rects };
 }
 
 /** Extracted so tests can swap it (Blob also works in Node) */
