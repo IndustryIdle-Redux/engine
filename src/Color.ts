@@ -1,17 +1,9 @@
 /**
- * Engine-agnostic color. Replaces `cc.Color` / `cc.color()`.
+ * Engine-agnostic color value, compatible with Cocos `cc.Color` / `cc.color()`.
  *
- * Semantics **match the Cocos implementation literally** (taken from the build artifact `build/web-mobile/cocos2d-js.js:32558-32729`):
- *  - `fromHEX` uses `parseInt(pair, 16) || 0`, with the alpha fallback `|| 255`
- *  - `toHEX(fmt)` supports `"#rgb"` / `#rrggbbaa"`
- *  - no-arg construction = **opaque white (255,255,255,255)** (that is what Cocos does, not black)
- *  - keeps the packed `_val` internally and syncs it whenever a channel changes
- *
- * Known differences from Cocos (intentional):
- *  Because of `parseInt("",16)||255`, Cocos' `fromHEX("#000000")` sets alpha to 0;
- *  this implementation keeps that `||255` fallback, but also treats `undefined/NaN` as 255,
- *  so `#000000` yields (0,0,0,255). All 59 call sites in the game pass **6-digit colors**,
- *  so in practice this "fixes the Cocos alpha=0 quirk" without regressing existing behavior.
+ * Cocos semantics kept: no-arg construction is opaque white, `fromHEX` uses a 0/255
+ * fallback for unparsable components, and `toHEX(fmt)` supports "#rgb" / "#rrggbbaa".
+ * The packed RGB value is kept in sync whenever a channel changes.
  */
 
 export class Color {
@@ -28,7 +20,7 @@ export class Color {
         this.a = a;
     }
 
-    /* ---------------- channels (setter syncs the packed value) ---------------- */
+    /* ---------------- channels (the setters sync the packed value) ---------------- */
 
     public get r(): number {
         return this._r;
@@ -80,35 +72,27 @@ export class Color {
 
     /* ---------------- parse / output ---------------- */
 
-    /**
-     * Set the color from a hex string (in place).
-     * Matches Cocos `Color.prototype.fromHEX` (cocos2d-js.js:32711).
-     */
+    /** Set the color from a hex string, in place. */
     public fromHEX(hexString: string): this {
         const s = hexString.charAt(0) === "#" ? hexString.substring(1) : hexString;
         this._r = parseInt(s.substring(0, 2), 16) || 0;
         this._g = parseInt(s.substring(2, 4), 16) || 0;
         this._b = parseInt(s.substring(4, 6), 16) || 0;
-        // for a 6-digit color substring(6,8) is empty → NaN; the Cocos ||255 fallback makes it opaque
+        // A 6-digit input leaves an empty alpha substring; the Cocos ||255 fallback makes it opaque.
         this._a = parseInt(s.substring(6, 8), 16) || 255;
         this._syncVal();
         return this;
     }
 
-    /** Matches Cocos `toHEX(fmt)`: no `#` prefix, optional `"#rgb"` / `"#rrggbbaa"` */
     /**
-     * Hex string.
-     *
-     * ⚠️ Mind the difference from the original `Color.toHEX(fmt)`: Cocos does **not special-case** `"#rrggbb"`,
-     * it falls straight into the default branch and returns a 6-digit string **without `#`** (`"ef5350"`).
-     * In the game `BuildPage.showTileModifiers` literally calls `.toHEX("#rrggbb")`,
-     * so we accept it here and keep the same output, to avoid a mismatch with the input of `chroma.scale(...)`.
+     * Hex string without a `#` prefix. `"#rgb"` and `"#rrggbbaa"` select the short and
+     * alpha forms; any other value (including `"#rrggbb"`) yields the 6-digit form, as in Cocos.
      */
     public toHEX(fmt?: "#rgb" | "#rrggbb" | "#rrggbbaa"): string {
         const pad = (n: number): string => (n < 16 ? "0" : "") + n.toString(16);
         const hex = [pad(this._r), pad(this._g), pad(this._b)];
         if (fmt === "#rgb") {
-            // under noUncheckedIndexedAccess index access may be undefined; here the length is fixed at 3 and filled
+            // The array is fixed at length 3 and filled just above; the casts only satisfy noUncheckedIndexedAccess.
             hex[0] = (hex[0] as string)[0] as string;
             hex[1] = (hex[1] as string)[0] as string;
             hex[2] = (hex[2] as string)[0] as string;
@@ -119,41 +103,23 @@ export class Color {
     }
 
     /**
-     * CSS form.
-     *
-     * Matches Cocos `toCSS(opt)` (`cocos2d-js.js:32708`):
-     * ```js
-     * opt && "rgba" !== opt
-     *   ? ("rgb" === opt ? "rgb(r,g,b)" : "#" + this.toHEX(opt))
-     *   : "rgba(r,g,b,a)"
-     * ```
-     * So apart from `"rgba"` / `"rgb"`, `opt` is **passed through to `toHEX` unchanged** --
-     * including `"#rrggbb"` (which matches no branch of `toHEX`, so it takes the default 3-part join),
-     * and the game uses that form both in `ColorThemes.getBuildingColor` and in the color theme editor.
-     *
-     * The only difference from the original: the alpha of `"rgba"` keeps 3 decimals (Cocos uses 2),
-     * which only affects CSS text precision, not the color.
+     * CSS color string, matching Cocos `toCSS(opt)`: `"rgb"` and `"rgba"` have their own
+     * forms, any other value is forwarded to `toHEX` with a `#` prefix.
+     * The game relies on `toCSS("#rrggbb")` for `<input type="color">` values.
      */
     public toCSS(opt?: "rgb" | "rgba" | "#rgb" | "#rrggbb" | "#rrggbbaa"): string {
-        // Matches Cocos `cocos2d/core/value-types/color.ts:639`:
-        //   return opt && opt !== "rgba"
-        //     ? opt === "rgb" ? `rgb(r,g,b)` : "#" + this.toHEX(opt)
-        //     : `rgba(r,g,b,a)`;
-        // ⚠️ note that `"#" +` -- Cocos' `toHEX` does **not** include `#`,
-        // so only `toCSS("#rrggbb")` gets the `#`. Without it the value fed to `<input type="color">`
-        // (from `getBuildingColor` / the theme editor) is invalid, and the browser treats it as black.
         if (opt && opt !== "rgba") {
             return opt === "rgb" ? `rgb(${this._r},${this._g},${this._b})` : "#" + this.toHEX(opt);
         }
         return `rgba(${this._r},${this._g},${this._b},${(this._a / 255).toFixed(2)})`;
     }
 
-    /** Packed RGB value (without alpha); matches Cocos `toRGBValue` */
+    /** Packed RGB value (without alpha) */
     public toRGBValue(): number {
         return this._val & 0xffffff;
     }
 
-    /** Set from an rgb array (matches Cocos `fromRGB`) */
+    /** Set from an rgb array */
     public fromRGB(array: number[] | Uint8Array): this {
         this._r = array[0] as number;
         this._g = array[1] as number;
@@ -162,7 +128,7 @@ export class Color {
         return this;
     }
 
-    /** Set from an RGBA array (matches Cocos `fromRGBA`) */
+    /** Set from an RGBA array */
     public fromRGBA(array: number[] | Uint8Array): this {
         this._r = array[0] as number;
         this._g = array[1] as number;
@@ -176,7 +142,7 @@ export class Color {
         return new Color(this._r, this._g, this._b, this._a);
     }
 
-    /* ---------------- channel reads (matching Cocos' getX form) ---------------- */
+    /* ---------------- channel reads ---------------- */
 
     public getR(): number {
         return this._r;
@@ -213,19 +179,17 @@ export class Color {
         return this;
     }
 
-    /** Per-channel linear interpolation (returns a new object, does not modify this), ratio=0 keeps this, ratio=1 becomes to */
+    /**
+     * Per-channel linear interpolation: ratio 0 keeps this, ratio 1 becomes `to`.
+     * Returns a new Color unless `out` is supplied, and never mutates the receiver.
+     */
     public lerp(to: Color, ratio: number, out?: Color): Color {
-        // Matches Cocos `Color.prototype.lerp`: **returns a new object, does not modify this**.
-        // ⚠️ this used to modify `this` in place, while the only call site is
-        // `getCurrentColor().grid.lerp(getCurrentColor().background, 0.5)`
-        // in `WaveManager.recalculateWormholePath`
-        // -- every recompute pulled the **global theme color object** another half-step toward the background,
-        // so after a dozen redraws the grid lines matched the background and became entirely invisible, and the theme was permanently polluted.
         const o = out ?? new Color();
         o._r = this._r + (to._r - this._r) * ratio;
         o._g = this._g + (to._g - this._g) * ratio;
         o._b = this._b + (to._b - this._b) * ratio;
         o._a = this._a + (to._a - this._a) * ratio;
+        o._syncVal();
         return o;
     }
 
@@ -251,7 +215,7 @@ export class Color {
         return this._r === other.r && this._g === other.g && this._b === other.b && this._a === other.a;
     }
 
-    /* ---------------- per-channel arithmetic (matching Cocos' methods of the same name) ---------------- */
+    /* ---------------- per-channel arithmetic (mutable, chainable) ---------------- */
 
     public add(other: Color): this {
         this._r += other.r;

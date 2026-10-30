@@ -1,14 +1,13 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
-/** The package directory. Set explicitly: vite/vitest resolve `lib.entry` and `test.include`
- *  relative to `root`, which otherwise defaults to the *current working directory* (the repo root). */
+/** The package directory. Pinned explicitly because `lib.entry` and `test.include` resolve
+ *  relative to `root`, which would otherwise default to the current working directory. */
 const dir = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
     root: dir,
-    // A library build needs an explicit resolution order: the engine sources
-    // use extensionless relative imports, matching the Cocos project it came from.
+    // The engine sources use extensionless relative imports, so `.ts` must be in the order.
     resolve: {
         extensions: [".ts", ".tsx", ".mjs", ".js", ".mts", ".json"],
     },
@@ -22,8 +21,8 @@ export default defineConfig({
         },
     },
     test: {
-        // The world-layer suites (`tests/features/**` in the game workspace) need game code and run
-        // under the game's own vitest config; this one covers the engine package only.
+        // World-layer suites live in the game workspace under its own vitest config;
+        // this config only covers the engine package.
         include: ["tests/**/*.test.ts"],
         environment: "node",
     },

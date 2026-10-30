@@ -121,7 +121,7 @@ describe("Mat3 extra information", () => {
         expect(Array.from(arr)).toEqual([1, 2, 0, 3, 4, 0, 5, 6, 1]);
     });
 
-    it("toMat3Array can reuse an external array (zero allocation on the hot path)", () => {
+    it("toMat3Array can reuse an external array", () => {
         const reused = new Float32Array(9);
         const out = new Mat3(1, 0, 0, 1, 2, 3).toMat3Array(reused);
         expect(out).toBe(reused);
@@ -130,7 +130,7 @@ describe("Mat3 extra information", () => {
     });
 });
 
-describe("Mat3 allocates nothing on the hot path", () => {
+describe("Mat3 out parameters", () => {
     it("multiplyTo / toMat3Array reuse the objects passed in", () => {
         const out = new Mat3();
         const arr = new Float32Array(9);

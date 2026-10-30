@@ -1,18 +1,10 @@
 /**
- * 2D affine transform matrix (3×3, storing the 6 significant components in column-major order).
+ * 2D affine transform matrix (3×3, storing the six significant components).
  *
- * Why write our own instead of using Cocos' `cc.AffineTransform`:
- * the renderer's transform math is a **hot path** (once per node per frame), so it needs:
- *  - to be pure and functional, batch-composable and inlinable (avoiding an allocation per call)
- *  - to be fully unit-testable in Node
- *
- * Storage order (matching WebGL's column-major `mat3`):
- *
- *     | a  c  tx |        a  c  tx
- *     | b  d  ty |   ⇒   [a, b, c, d, tx, ty]
- *     | 0  0  1  |
- *
- * So it can be used directly as the first three columns of the 9-element array for `uniformMatrix3fv` (see `toMat3Array`).
+ * Components are stored column-major as [a, b, c, d, tx, ty], which maps directly onto
+ * the nine-element array expected by WebGL's `mat3` uniform (see `toMat3Array`).
+ * Operations are pure or write into an `out` argument, so render code can avoid
+ * per-call allocation.
  */
 
 import { Vec2 } from "./Vec2";
@@ -66,10 +58,8 @@ export class Mat3 implements Mat3Like {
     }
 
     /**
-     * Composite transform: equivalent to scale → rotate → translate.
-     *
-     * This is the standard order for node transforms (matching Cocos `Node`),
-     * and merging it into a single matrix avoids three matrix multiplications.
+     * Composite transform: equivalent to scale → rotate → translate, the standard
+     * order for node transforms, merged into a single matrix.
      */
     public static fromTRS(x: number, y: number, rotationRad: number, sx: number, sy: number): Mat3 {
         const c = Math.cos(rotationRad);
@@ -102,10 +92,9 @@ export class Mat3 implements Mat3Like {
     }
 
     /**
-     * In-place left multiply: `this = this × m`
+     * In-place left multiply: `this = this × m`.
      *
-     * Semantics: fold `m` in as the "parent space → this node's space" transform,
-     * i.e. the result applies m first and then this (consistent with matrix multiplication order).
+     * The result applies `m` first and then this, consistent with matrix multiplication order.
      */
     public multiply(m: Mat3Like): this {
         const { a, b, c, d, tx, ty } = this;
@@ -179,10 +168,8 @@ export class Mat3 implements Mat3Like {
     }
 
     /**
-     * Convert to the 9-element column-major array for a WebGL `mat3`.
-     *
-     * The result can be passed straight to `gl.uniformMatrix3fv`.
-     * `out` can be reused to avoid an allocation per frame (hot path).
+     * Convert to the 9-element column-major array for a WebGL `mat3`, ready for
+     * `gl.uniformMatrix3fv`. Pass `out` to reuse the array across frames.
      */
     public toMat3Array(out?: Float32Array): Float32Array {
         const arr = out ?? new Float32Array(9);

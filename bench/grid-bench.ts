@@ -1,11 +1,6 @@
 /**
  * Pure CPU grid benchmark (no GL, and no vitest/vite dependency -- run directly with esbuild + node).
  *
- * Reference measurements from the original (Steam build, CDP sampling):
- *   `HexagonGrid.drawGrid` 100×100 full map = 13.1 / 13.1 / 15.0 ms
- *   Method: it calls `stroke()` once **for each of the 10,000 hexagons**
- *   (each time rebuilding the path → triangulating → uploading a dynamic vertex buffer)
- *
  * Run: node tools/engine/bench-grid.mjs
  */
 import { buildHexGridLines, buildHexGridLinesFast } from "../src/renderer/GridGeometry";
@@ -24,11 +19,9 @@ console.log("\nOriginal measured: HexagonGrid.drawGrid 100×100 = 13.1~15.0 ms (
 console.log("(Below is pure JS geometry generation time, excluding GPU upload)\n");
 
 /*
- * ⚠️ Visible rects must use the **current** tile coordinate convention, not the pre-fix one.
- * `hexCenter` puts tile (col,row) at `x = (col + odd/2)·√3·tile + √3·tile/2`, `y = tile + row·1.5·tile`,
- * so a 100×100 map with tile=32 occupies x ∈ [27.7, 5543] and **y ∈ [32, 4784]** (y grows with row).
- * The rects here used to be y-negative (an era when y decreased with row); against today's mapping they
- * fell entirely outside the map, so the "visible area" rows silently reported 0 edges.
+ * The rects use the current tile coordinate convention: `hexCenter` places tile (col,row)
+ * at x = (col + odd/2)·√3·tile + √3·tile/2 and y = tile + row·1.5·tile, so a 100×100 map
+ * with tile=32 spans x ∈ [27.7, 5543] and y ∈ [32, 4784] (y grows with row).
  */
 const full = { x: 0, y: 0, width: 5600, height: 4800 };
 bench("dedup     full map (10,000 tiles)", () => buildHexGridLines(100, 32, full).length);

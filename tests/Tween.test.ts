@@ -71,6 +71,22 @@ describe("TweenManager basic tweens", () => {
         expect(target.x).toBeGreaterThan(0);
     });
 
+    it("one tween's delay overshoot does not shorten another tween's advance in the same frame", () => {
+        const tweens = new TweenManager();
+        const first = { x: 0 };
+        const second = { x: 0 };
+        // `update` walks the snapshot in reverse insertion order, so `second` is processed first.
+        tweens.to(first, { x: 10 }, { duration: 1, delay: 0.3 });
+        tweens.to(second, { x: 10 }, { duration: 1, delay: 0.1 });
+
+        tweens.update(0.5);
+
+        // The shorter delay is processed first; both tweens advance on this frame.
+        // If the shared dt were mutated, the longer delay would be cut to 0.2 s and `first` would not start.
+        expect(first.x).toBeCloseTo(3, 6);
+        expect(second.x).toBeCloseTo(1, 6);
+    });
+
     it("overshooting the duration does not overshoot the target value", () => {
         const tweens = new TweenManager();
         const target = { x: 0 };

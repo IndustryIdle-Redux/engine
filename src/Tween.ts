@@ -1,13 +1,8 @@
 /**
- * Tweening -- replaces Cocos' `cc.tween` / `cc.easing`.
+ * Tweening (Cocos `cc.tween` / `cc.easing` replacement).
  *
- * ### Why not `cc.tween`
- * In the original implementation every `cc.tween(this).to(...).start()` call **allocates a new Action object
- * and attaches it to the engine's ActionManager** (measured to be one source of GC pressure on hot paths).
- * Here it is changed to a "**one array + advance per frame**" model:
- *  - `TweenManager.update(dt)` linearly scans the active tweens (there are very few, on the order of dozens)
- *  - tween objects can be **pooled and reused**, so steady state allocates nothing
- *  - easing functions are pure and unit-testable
+ * A single active array is advanced once per frame, tween records are pooled so the
+ * steady state allocates nothing, and easing functions are pure and unit-testable.
  */
 
 import type { Color } from "./Color";
@@ -130,7 +125,8 @@ export class TweenManager {
     /**
      * Tween from the current values to the target values.
      *
-     * Only **numeric fields** in `props` are handled; for other types (arrays/colors) use `toColor`.
+     * Only numeric fields in `props` are handled. A new tween supersedes live tweens on
+     * the same properties of the same target, so two tweens never fight over one field.
      */
     public to<T extends Tweenable>(
         target: T,
@@ -139,8 +135,6 @@ export class TweenManager {
     ): void {
         const keys = Object.keys(props);
         // Supersede: drop active tweens writing the same properties of the same target.
-        // Two live tweens on one property fight frame by frame — visible as a "jumping" sprite
-        // (this is what made highlighted building logos jitter whenever their tick state flapped).
         const keySet = new Set(keys);
         for (let i = this.active.length - 1; i >= 0; i--) {
             const t = this.active[i] as ActiveTween<Tweenable> | undefined;
@@ -198,22 +192,15 @@ export class TweenManager {
         for (const t of this.active) t.done = true;
     }
 
+    /** Snapshot buffer reused by `update` (no allocation per frame) */
+    private readonly iterating: ActiveTween<Tweenable>[] = [];
+
     /**
      * Advance all tweens (called every frame); returns how many finished this frame.
      *
-     * ⚠️ **Completion callbacks may mutate `active`**: `ResourceAnimation`'s coin chain creates its
-     * flight tween from the scatter tween's `onComplete`, and `to()` removes every live tween that
-     * writes the same properties of the same target (it supersedes the scatter tween that is being
-     * completed right now). `splice()` shifts the array, so iterating with an index while callbacks
-     * splice **removes the wrong entry**: the tween that slides into the current index is dropped
-     * from `active` without ever finishing — the coin's flight tween then never runs and the coin
-     * instance is never removed, so **coins stay on screen forever**.
-     *
-     * Hence the walk uses a snapshot and unlinks by **identity**; tweens created from a callback
-     * start on the next frame (they are not in the snapshot), which matches the previous behaviour.
+     * Completion callbacks may create or supersede tweens, so the walk uses a snapshot and
+     * unlinks by identity. Tweens created from a callback start on the next frame.
      */
-    private readonly iterating: ActiveTween<Tweenable>[] = [];
-
     public update(dt: number): number {
         let finished = 0;
         const active = this.active;
@@ -231,14 +218,18 @@ export class TweenManager {
                 continue;
             }
 
+            let delta = dt;
+
             if (t.delay > 0) {
                 t.delay -= dt;
                 if (t.delay > 0) continue;
-                dt += t.delay; // once the delay ends, the leftover time counts toward this frame
+                // Use a per-tween copy of dt: the delay overshoot only advances this tween,
+                // and must not change dt for the other tweens in the same frame.
+                delta += t.delay;
                 t.delay = 0;
             }
 
-            t.elapsed += dt;
+            t.elapsed += delta;
             const progress = Math.min(1, t.elapsed / t.duration);
             const eased = t.easing(t.reversed ? 1 - progress : progress);
 
