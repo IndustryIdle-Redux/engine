@@ -557,4 +557,24 @@ describe("Perf smoke: per-frame work budgets", () => {
         expect(counters.instances).toBe(ctx.fake.spriteSubmissions);
         expect(counters.instances).toBe(ctx.fake.sprites.length);
     });
+
+    it("keeps draw calls flat when the atlas is missing building sprites", () => {
+        const ctx = makeWorld();
+        ctx.world.updateConfig({ showGrid: false });
+        ctx.fake.camera.zoom = 1;
+        // no atlas sprite at all: every building body is a miss
+        ctx.world.setSpriteSource({ texture: TEXTURE, get: () => undefined });
+        const buildings = centerBuildings(ctx.generated);
+
+        ctx.world.drawGrid();
+        ctx.fake.reset();
+        ctx.world.drawBuildings({ buildings });
+
+        expect(ctx.world.stats.missingSprites).toBe(buildings.length);
+        // the old fallback drew a vector polygon per missing building, switching layers once per
+        // entity; the only layer left now is the level-digit font batch
+        expect(ctx.fake.kinds).not.toContain("vector");
+        expect(ctx.fake.kinds).toEqual(["sprite"]);
+        expect(ctx.fake.drawCalls).toBeLessThanOrEqual(2);
+    });
 });

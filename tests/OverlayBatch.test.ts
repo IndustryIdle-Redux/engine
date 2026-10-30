@@ -12,7 +12,8 @@
  * superset) and the LOD thresholds, which must not change.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { Color } from "../src/Color";
 import { Camera2D } from "../src/renderer/Camera2D";
 import { BitmapFont } from "../src/renderer/BitmapFont";
 import { generateWorld } from "../src/worldgen/generateWorld";
@@ -22,6 +23,7 @@ import {
     WorldRenderer,
     type SpriteSource,
 } from "../src/renderer/WorldRenderer";
+import { DEFAULT_THEME_NAME, getTheme, THEMES } from "../src/renderer/Theme";
 import type { RenderTexture } from "../src/renderer/RenderDevice";
 import type { Renderer2D } from "../src/renderer/Renderer2D";
 
@@ -42,6 +44,14 @@ interface FakeRenderer {
     fills: Array<{ x: number; y: number }>;
     /** sprite submissions with their world positions and the texture they used */
     sprites: Array<{ x: number; y: number; texture: RenderTexture }>;
+    /** colors passed to each sprite submission */
+    spriteColors: Array<Color | undefined>;
+    /** colors passed to each grid-line submission */
+    segmentColors: Array<Color | undefined>;
+    /** colors passed to each overlay fill submission */
+    fillColors: Array<Color | undefined>;
+    /** start a new frame */
+    reset(): void;
 }
 
 function makeRenderer(): FakeRenderer {
@@ -51,6 +61,9 @@ function makeRenderer(): FakeRenderer {
     const kinds: SubmitKind[] = [];
     const fills: Array<{ x: number; y: number }> = [];
     const sprites: Array<{ x: number; y: number; texture: RenderTexture }> = [];
+    const spriteColors: Array<Color | undefined> = [];
+    const segmentColors: Array<Color | undefined> = [];
+    const fillColors: Array<Color | undefined> = [];
     let last: SubmitKind | null = null;
 
     const submit = (kind: SubmitKind): void => {
@@ -73,22 +86,27 @@ function makeRenderer(): FakeRenderer {
             }
             return tri;
         },
-        fillPolygonTemplateAt: (_template: readonly number[], x: number, y: number) => {
+        fillPolygonTemplateAt: (_template: readonly number[], x: number, y: number, color?: Color) => {
             submit("vector");
             fills.push({ x, y });
+            fillColors.push(color);
         },
         fillPolygonTemplate: (_template: readonly number[], centers: ReadonlyArray<{ x: number; y: number }>) => {
             submit("vector");
             for (const c of centers) fills.push({ x: c.x, y: c.y });
         },
-        drawSprite: (tex: RenderTexture, call: { x: number; y: number }) => {
+        drawSprite: (tex: RenderTexture, call: { x: number; y: number; color?: Color }) => {
             submit("sprite");
             sprites.push({ x: call.x, y: call.y, texture: tex });
+            spriteColors.push(call.color);
         },
         fillCircle: () => submit("vector"),
         fillRegularPolygon: () => submit("vector"),
         strokePolyline: () => submit("vector"),
-        drawSegments: () => submit("vector"),
+        drawSegments: (_segments: unknown, _width: number, color?: Color) => {
+            submit("vector");
+            segmentColors.push(color);
+        },
         getVisibleRect: (out?: { x: number; y: number; width: number; height: number }) => camera.getVisibleRect(out),
     } as unknown as Renderer2D;
 
@@ -98,8 +116,20 @@ function makeRenderer(): FakeRenderer {
         kinds,
         fills,
         sprites,
+        spriteColors,
+        segmentColors,
+        fillColors,
         get drawCalls() {
             return kinds.length + (last ? 1 : 0);
+        },
+        reset() {
+            kinds.length = 0;
+            fills.length = 0;
+            sprites.length = 0;
+            spriteColors.length = 0;
+            segmentColors.length = 0;
+            fillColors.length = 0;
+            last = null;
         },
     };
     return rec;
@@ -167,6 +197,17 @@ function makeWorld(
 const glyphs = (fake: FakeRenderer): Array<{ x: number; y: number }> =>
     fake.sprites.filter((s) => s.texture === FONT_TEXTURE);
 
+/** Assert two colors have the same channels */
+const expectColor = (actual: Color | undefined, expected: Color): void => {
+    expect(actual).toBeDefined();
+    expect([actual?.r, actual?.g, actual?.b, actual?.a]).toEqual([
+        expected.r,
+        expected.g,
+        expected.b,
+        expected.a,
+    ]);
+};
+
 describe("drawOverlay: two-pass submission keeps the draw-call count flat", () => {
     it("does not grow draw calls when the visible tile count grows 10x", () => {
         const small = makeWorld("hex", 40, 320);
@@ -207,7 +248,7 @@ describe("drawOverlay: two-pass submission keeps the draw-call count flat", () =
         const { fake, world, generated } = makeWorld("hex", 40, 3200);
         fake.camera.position.set(1100, 950);
 
-        // tiles below overlayMinTilePx: nothing at all, and the stats keep their previous values
+        // tiles below overlayMinTilePx: nothing at all, and the stats are reset (not stale)
         fake.camera.zoom = 0.1; // tilePx = 3.2 < 5
         world.drawOverlay(generated.tiles, () => 0.5);
         expect(fake.kinds).toEqual([]);
@@ -426,5 +467,220 @@ describe("drawDeposits: static and runtime lists are equivalent", () => {
         expect(world.stats.deposits).toBe(0);
         expect(world.stats.depositsHidden).toBe(1);
         expect(fake.sprites.length).toBe(0);
+    });
+});
+
+describe("theme contract", () => {
+    it("DEFAULT_WORLD_CONFIG uses the engine default theme and leaves colors to it", () => {
+        expect(DEFAULT_WORLD_CONFIG.theme.name).toBe(THEMES[DEFAULT_THEME_NAME]?.name);
+        expect(DEFAULT_WORLD_CONFIG.theme.grid.r).toBe(THEMES[DEFAULT_THEME_NAME]?.grid.r);
+        // the per-color config fields are optional overrides now
+        expect(DEFAULT_WORLD_CONFIG.gridColor).toBeUndefined();
+        expect(DEFAULT_WORLD_CONFIG.depositColor).toBeUndefined();
+        expect(DEFAULT_WORLD_CONFIG.buildingColor).toBeUndefined();
+        expect(DEFAULT_WORLD_CONFIG.ringColor).toBeUndefined();
+        expect(DEFAULT_WORLD_CONFIG.textColor).toBeUndefined();
+    });
+
+    it("resolves omitted colors from the active theme", () => {
+        const { fake, world, generated } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+        const theme = getTheme("SolarizedDark");
+        world.updateConfig({ theme });
+
+        fake.reset();
+        world.drawGrid();
+        expectColor(fake.segmentColors[0], theme.grid);
+
+        world.updateConfig({ showGrid: false });
+        fake.reset();
+        world.drawBuildings({
+            buildings: [{ key: "1,1", type: "CoalMine", x: 1100, y: 950, level: 1, levelVisible: false }],
+        });
+        expectColor(fake.spriteColors[0], theme.building);
+
+        fake.reset();
+        world.drawDeposits(generated, undefined, false, [
+            { key: "d1", type: "Coal", x: 1100, y: 950, size: 24, active: true },
+        ]);
+        expectColor(fake.spriteColors[0], theme.building);
+
+        fake.reset();
+        world.drawOverlay(generated.tiles, () => 0.5);
+        expect(fake.spriteColors.length).toBeGreaterThan(0);
+        for (const color of fake.spriteColors) expectColor(color, theme.building);
+    });
+
+    it("lets explicit config colors win over the theme", () => {
+        const { fake, world } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+        const explicitGrid = new Color(1, 2, 3, 255);
+        const explicitBuilding = new Color(4, 5, 6, 255);
+        world.updateConfig({
+            theme: getTheme("SolarizedDark"),
+            gridColor: explicitGrid,
+            buildingColor: explicitBuilding,
+        });
+
+        fake.reset();
+        world.drawGrid();
+        expectColor(fake.segmentColors[0], explicitGrid);
+
+        world.updateConfig({ showGrid: false });
+        fake.reset();
+        world.drawBuildings({
+            buildings: [{ key: "1,1", type: "CoalMine", x: 1100, y: 950, level: 1, levelVisible: false }],
+        });
+        expectColor(fake.spriteColors[0], explicitBuilding);
+    });
+
+    it("changes the resolved colors when updateConfig sets a new theme", () => {
+        const { fake, world } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+
+        const blue = getTheme("Blue");
+        world.updateConfig({ theme: blue });
+        fake.reset();
+        world.drawGrid();
+        expectColor(fake.segmentColors[0], blue.grid);
+
+        const github = getTheme("GithubLight");
+        world.updateConfig({ theme: github });
+        fake.reset();
+        world.drawGrid();
+        expectColor(fake.segmentColors[0], github.grid);
+        expect(fake.segmentColors[0]?.r).not.toBe(blue.grid.r);
+    });
+
+    it("clones themes so renderers never share mutable colors", () => {
+        const a = getTheme("Blue");
+        const b = getTheme("Blue");
+        expect(a).not.toBe(b);
+        expect(a.grid).not.toBe(b.grid);
+
+        const original = THEMES[DEFAULT_THEME_NAME]?.grid.r as number;
+        a.grid.r = 1;
+        expect(b.grid.r).toBe(original);
+        expect(THEMES[DEFAULT_THEME_NAME]?.grid.r).toBe(original);
+
+        // updateConfig also clones: mutating the theme afterwards does not affect the renderer
+        const { fake, world } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+        const handedOver = getTheme("SolarizedDark");
+        world.updateConfig({ theme: handedOver });
+        handedOver.grid.r = 1;
+        handedOver.grid.g = 1;
+        handedOver.grid.b = 1;
+        fake.reset();
+        world.drawGrid();
+        expect(fake.segmentColors[0]?.r).not.toBe(1);
+    });
+});
+
+describe("draw stats are reset by every entry point", () => {
+    it("clears gridLines when the grid is switched off", () => {
+        const { fake, world } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+        world.drawGrid();
+        expect(world.stats.gridLines).toBeGreaterThan(0);
+
+        world.updateConfig({ showGrid: false });
+        world.drawGrid();
+        expect(world.stats.gridLines).toBe(0);
+    });
+
+    it("clears overlayCells/textGlyphs when the LOD skips the overlay", () => {
+        const { fake, world, generated } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+        world.drawOverlay(generated.tiles, () => 0.5);
+        expect(world.stats.overlayCells).toBeGreaterThan(0);
+        expect(world.stats.textGlyphs).toBeGreaterThan(0);
+
+        fake.camera.zoom = 0.1; // below overlayMinTilePx
+        world.drawOverlay(generated.tiles, () => 0.5);
+        expect(world.stats.overlayCells).toBe(0);
+        expect(world.stats.textGlyphs).toBe(0);
+
+        world.drawOverlayText(generated.tiles, () => ({ text: "1" }));
+        expect(world.stats.overlayCells).toBe(0);
+        expect(world.stats.textGlyphs).toBe(0);
+    });
+
+    it("clears the building counters when no building is visible", () => {
+        const { fake, world } = makeWorld("hex", 40, 3200);
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+        world.drawBuildings({
+            buildings: [{ key: "1,1", type: "CoalMine", x: 1100, y: 950, level: 2, levelVisible: true }],
+        });
+        expect(world.stats.buildings).toBe(1);
+        expect(world.stats.levelGlyphs).toBeGreaterThan(0);
+
+        // move the camera far off the map: every building is culled
+        fake.camera.position.set(1_000_000, 1_000_000);
+        world.drawBuildings({
+            buildings: [{ key: "1,1", type: "CoalMine", x: 1100, y: 950, level: 2, levelVisible: true }],
+        });
+        expect(world.stats.buildings).toBe(0);
+        expect(world.stats.levelGlyphs).toBe(0);
+    });
+});
+
+describe("missing atlas sprites", () => {
+    it("draws nothing, keeps draw calls flat and counts the misses", () => {
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+            const { fake, world } = makeWorld("hex", 40, 3200);
+            world.updateConfig({ showGrid: false });
+            world.setSpriteSource({ texture: TEXTURE, get: () => undefined });
+            fake.camera.position.set(1100, 950);
+            fake.camera.zoom = 1;
+
+            const buildings = [
+                { key: "a", type: "CoalMine", x: 1100, y: 950, level: 1, levelVisible: false },
+                { key: "b", type: "CoalMine", x: 1140, y: 950, level: 1, levelVisible: false },
+                { key: "c", type: "Bakery", x: 1180, y: 950, level: 1, levelVisible: false },
+            ];
+
+            world.drawGrid(); // frame start: resets the per-frame counters
+            world.drawBuildings({ buildings });
+            expect(world.stats.missingSprites).toBe(3);
+            // no vector fallback: the old polygon fallback would have submitted one vector
+            // shape per missing building and pushed the draw-call count up with the entity count
+            expect(fake.kinds).toEqual([]);
+            expect(fake.drawCalls).toBe(0);
+            // one warning per missing name, not per entity
+            expect(warnSpy).toHaveBeenCalledTimes(2);
+
+            // the next frame reports the same count (the stat is reset, not accumulated)
+            world.drawGrid();
+            world.drawBuildings({ buildings });
+            expect(world.stats.missingSprites).toBe(3);
+            expect(warnSpy).toHaveBeenCalledTimes(2);
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
+    it("applies the same rule to deposits", () => {
+        const { fake, world, generated } = makeWorld("hex", 40, 3200);
+        world.updateConfig({ showGrid: false });
+        world.setSpriteSource({ texture: TEXTURE, get: () => undefined });
+        fake.camera.position.set(1100, 950);
+        fake.camera.zoom = 1;
+
+        world.drawGrid();
+        world.drawDeposits(generated, undefined, false, [
+            { key: "d1", type: "Coal", x: 1100, y: 950, size: 24, active: true },
+        ]);
+        expect(world.stats.missingSprites).toBe(1);
+        expect(world.stats.deposits).toBe(0);
+        expect(fake.kinds).toEqual([]);
     });
 });

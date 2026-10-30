@@ -1,36 +1,30 @@
 /**
- * Color theme -- **value-for-value identical** to the game's `shared/domain/ColorThemes.ts`.
+ * Color themes.
  *
- * Extraction method: parse the `IColorTheme` fields of `ColorThemes.ts` directly, with no derivation.
- * Default `color = COLORS.Blue` (see `let color = COLORS.Blue;` in the original file).
- *
- * ### What each entry is used for in rendering (compared against the original)
- *  | Field                | Purpose |
- *  |----------------------|---------|
- *  | `background`         | world-layer clear color |
- *  | `grid`               | grid lines (`Grid.drawGrid`) |
- *  | `gridSelected`       | hexagon highlight of the selected tile (with alpha) |
- *  | `building`           | **buildings, deposits**, level numbers, icons (`makeDeposit` uses this color too) |
- *  | `buildingSelected`   | tint of the selected building |
- *  | `hq`                 | HQ-only color (the HQ special case in `getVisualColor`) |
- *  | `modifierOverlayMin` | **low** end of the overlay gradient |
- *  | `modifierOverlayMax` | **high** end of the overlay gradient |
+ * The palettes mirror the game's `ColorThemes.ts`. The world renderer takes its default
+ * grid/building/deposit/ring/text colors from the active theme; explicit config colors win.
  */
 
 import { Color } from "../Color";
 
 export interface IColorTheme {
     name: string;
+    /** world clear color */
     background: Color;
+    /** grid lines */
     grid: Color;
+    /** selected-tile outline */
     gridSelected: Color;
+    /** buildings, deposits, level digits and overlay text */
     building: Color;
+    /** selected building tint */
     buildingSelected: Color;
+    /** HQ-only tint */
     hq: Color;
     red: Color;
     orange: Color;
     green: Color;
-    /** Panel override color (used by the UI, not by the world layer) */
+    /** Panel override colors (UI only, unused by the world layer) */
     panelBackgroundOverride?: Color;
     panelForegroundOverride?: Color;
     barBackgroundOverride?: Color;
@@ -48,7 +42,11 @@ const COLOR_RED = hex("#e74c3c");
 const COLOR_GREEN = hex("#2ecc71");
 const COLOR_ORANGE = hex("#f39c12");
 
-/** The 6 themes, exactly matching `ColorThemes.ts` */
+/** Fallbacks used when a theme does not define its overlay gradient endpoints */
+const DEFAULT_OVERLAY_MIN = new Color(255, 118, 117, 255);
+const DEFAULT_OVERLAY_MAX = new Color(85, 239, 196, 255);
+
+/** The built-in themes, value for value the game's palette */
 export const THEMES: Record<string, IColorTheme> = {
     Blue: {
         name: "Blueprint",
@@ -141,27 +139,49 @@ export const THEMES: Record<string, IColorTheme> = {
     },
 };
 
-/** Default theme, matching the game's `let color = COLORS.Blue` */
+/** Default theme name, matching the game's `COLORS.Blue` */
 export const DEFAULT_THEME_NAME = "Blue";
 
+/** Deep copy, so callers never share mutable `Color` objects with the theme table. */
+export function cloneTheme(theme: IColorTheme): IColorTheme {
+    return {
+        name: theme.name,
+        background: theme.background.clone(),
+        grid: theme.grid.clone(),
+        gridSelected: theme.gridSelected.clone(),
+        building: theme.building.clone(),
+        buildingSelected: theme.buildingSelected.clone(),
+        hq: theme.hq.clone(),
+        red: theme.red.clone(),
+        orange: theme.orange.clone(),
+        green: theme.green.clone(),
+        panelBackgroundOverride: theme.panelBackgroundOverride?.clone(),
+        panelForegroundOverride: theme.panelForegroundOverride?.clone(),
+        barBackgroundOverride: theme.barBackgroundOverride?.clone(),
+        barForegroundOverride: theme.barForegroundOverride?.clone(),
+        dlc: theme.dlc,
+        modifierOverlayMin: theme.modifierOverlayMin?.clone(),
+        modifierOverlayMax: theme.modifierOverlayMax?.clone(),
+    };
+}
+
+/** Look up a theme by name; falls back to the default theme. Returns a deep copy. */
 export function getTheme(name: string): IColorTheme {
-    return THEMES[name] ?? (THEMES[DEFAULT_THEME_NAME] as IColorTheme);
+    return cloneTheme(THEMES[name] ?? (THEMES[DEFAULT_THEME_NAME] as IColorTheme));
 }
 
 /**
- * Overlay gradient color: `value ∈ [0,1]` interpolated between `modifierOverlayMin → Max`.
- *
- * Matches the original `World.getTileModifier`, which colors tiles with a chroma gradient.
- * `alpha` is supplied by the caller (the original uses the overlay opacity).
+ * Overlay fill color: `value` in [0, 1] interpolated between the theme's gradient
+ * endpoints, with the caller-supplied alpha. Pass `out` to avoid allocating per tile.
  */
-export function overlayGradient(theme: IColorTheme, value: number, alpha = 60): Color {
+export function overlayGradient(theme: IColorTheme, value: number, alpha = 60, out?: Color): Color {
     const t = Math.max(0, Math.min(1, value));
-    const a = theme.modifierOverlayMin ?? new Color(255, 118, 117, 255);
-    const b = theme.modifierOverlayMax ?? new Color(85, 239, 196, 255);
-    return new Color(
-        Math.round(a.r + (b.r - a.r) * t),
-        Math.round(a.g + (b.g - a.g) * t),
-        Math.round(a.b + (b.b - a.b) * t),
-        alpha,
-    );
+    const lo = theme.modifierOverlayMin ?? DEFAULT_OVERLAY_MIN;
+    const hi = theme.modifierOverlayMax ?? DEFAULT_OVERLAY_MAX;
+    const color = out ?? new Color();
+    color.r = Math.round(lo.r + (hi.r - lo.r) * t);
+    color.g = Math.round(lo.g + (hi.g - lo.g) * t);
+    color.b = Math.round(lo.b + (hi.b - lo.b) * t);
+    color.a = alpha;
+    return color;
 }
