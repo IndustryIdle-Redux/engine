@@ -1,18 +1,9 @@
 /**
- * Instanced sprite batch -- the core of the renderer.
+ * Instanced sprite batch: one `Float32Array` of instances plus one `drawArraysInstanced`
+ * per texture batch. The unit quad is generated in the vertex shader, so no quad VBO is needed.
  *
- * Replaces Cocos's "one `cc.Node` + `cc.Sprite` per sprite" model.
- *
- * ### Why this is the key change
- * The original version measured **13,042 nodes** on a large save (10,000 of them overlay Labels, 28.7 MB of heap),
- * and every frame it walked the scene graph, wrote dirty flags and rebuilt dynamic buffers for each node.
- * Here it becomes "one `Float32Array` + one `drawArraysInstanced`":
- * the per-frame cost only depends on the **visible instance count**, with **zero allocations** in steady state (GC pressure gone).
- *
- * ### Structure
- *  - The **unit quad** (6 vertices) is generated in the vertex shader, so no quad VBO is needed
- *  - 16 floats per instance (see the layout notes in `InstanceBuffer`)
- *  - Only identical textures can merge into one draw call; this class batches by texture
+ * Only consecutive draws with the same texture merge, so sorting the input by texture gives
+ * the fewest draw calls.
  */
 
 import { InstanceBuffer, INSTANCE_ATTRIBS, FLOATS_PER_INSTANCE } from "../InstanceBuffer";
@@ -23,14 +14,12 @@ import { Texture } from "./Texture";
 export const VERTEX_SHADER_SOURCE = `#version 300 es
 precision highp float;
 
-// Unit quad: generated from gl_VertexID, saving a quad VBO
-// 6 vertices → (position, UV): two triangles
+// Unit quad generated from gl_VertexID: two triangles, 6 vertices
 const vec2 QUAD[6] = vec2[6](
     vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
     vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0)
 );
 
-// -- per-instance attributes --
 layout(location = 0) in vec2 a_center;
 layout(location = 1) in vec2 a_size;
 layout(location = 2) in vec2 a_anchor;
@@ -47,10 +36,10 @@ out vec4 v_color;
 void main() {
     vec2 q = QUAD[gl_VertexID];
 
-    // Anchor: translate the [0,1] quad so the anchor lands at the origin
+    // Place the anchor at the origin, then scale
     vec2 local = (q - a_anchor) * a_size;
 
-    // Instance rotation (cos/sin precomputed, so no trig in the shader)
+    // Rotation is precomputed per instance as (cos, sin)
     vec2 rotated = vec2(
         local.x * a_rot.x - local.y * a_rot.y,
         local.x * a_rot.y + local.y * a_rot.x
@@ -58,7 +47,6 @@ void main() {
 
     vec2 world = a_center + rotated;
 
-    // The projection matrix maps world coordinates into clip space
     vec3 clip = u_projection * vec3(world, 1.0);
     gl_Position = vec4(clip.xy, 0.0, 1.0);
 
@@ -94,9 +82,6 @@ function compileShader(gl: WebGL2RenderingContext, type: number, source: string)
     return shader;
 }
 
-/** Number of instance attribute locations used in the shader (must match the length of INSTANCE_ATTRIBS) */
-export const SHADER_ATTRIBUTE_COUNT = 7;
-
 /** One draw unit batched by texture */
 export interface Batch {
     texture: Texture;
@@ -107,12 +92,11 @@ export interface Batch {
 }
 
 /**
- * Batch splitting (pure logic, no GL dependency, so it can be unit-tested directly).
+ * Batch splitting (pure logic, no GL dependency).
  *
- * Why it is extracted: `flush()` must use `batch.start` to rebind the instance attribute pointers
- * (instance attributes fetch by `gl_InstanceID`, which restarts from 0 for every draw call);
- * get this `start` wrong and the picture goes **silently wrong** (the second batch reads the first batch's instances).
- * Living here, it can be locked down by unit tests without constructing a GL context.
+ * `flush()` uses `start` to offset the instance attribute pointers: instance attributes are
+ * indexed by `gl_InstanceID`, which restarts at 0 for every draw, so a batch must rebind its
+ * pointer to `start * stride` or it re-reads the first batch's instances.
  */
 export class BatchList {
     public readonly items: Batch[] = [];
@@ -121,11 +105,7 @@ export class BatchList {
         this.items.length = 0;
     }
 
-    /**
-     * Append one instance.
-     * If the texture matches the previous batch it is merged in (only count increases), otherwise a new batch starts at `start`.
-     * So **sorting the input by texture** gives the fewest draw calls.
-     */
+    /** Append one instance, merging into the previous batch when the texture matches. */
     public add(texture: Texture, start: number): void {
         const last = this.items[this.items.length - 1];
         if (last && last.texture === texture) {
@@ -148,32 +128,25 @@ export class SpriteBatch {
     private readonly uProjection: WebGLUniformLocation;
     private readonly uTexture: WebGLUniformLocation;
 
-    /** Instance data (reused; zero allocations in steady state) */
+    /** Instance data (reused across frames) */
     public readonly instances = new InstanceBuffer(1024);
     private readonly batches = new BatchList();
     private readonly projection = new Mat3();
     private readonly projectionArray = new Float32Array(9);
 
     /**
-     * Instances already written to the GPU buffer this frame (the **upload watermark**).
+     * Instances already uploaded this frame.
      *
-     * `flush()` writes only `[uploaded, instances.count)` and then advances the watermark, so every
-     * byte is uploaded exactly once per frame and the ranges of successive flushes are **disjoint**.
-     *
-     * ⚠️ Why disjointness matters: a frame can flush many times (every vector/sprite layer switch),
-     * and earlier draws may still be in flight when a later flush writes. Reusing offset 0 would
-     * overwrite data those draws are still reading (GL only guarantees this is safe for a full
-     * reallocation, i.e. orphaning). The WebGPU backend has the same invariant, for a stronger
-     * reason (`WebGPUDevice.flushSprites`: `queue.writeBuffer` is not stream-ordered).
+     * `flush()` writes only `[uploaded, count)` so successive flushes write disjoint ranges;
+     * an earlier draw may still be reading its range when a later flush uploads.
      */
     private uploaded = 0;
-    /** GPU data-store size in bytes; `bufferData` is only called when growing, never per flush */
+    /** GPU data-store size in bytes; `bufferData` is only called when growing */
     private glCapacityBytes = 0;
+    /** Blend state currently set, so it is switched only when a batch needs a different mode */
+    private premultipliedBlend = false;
 
-    /**
-     * Draw call count of the **last** `flush()` (for the performance panel; replaces reading
-     * cc.renderer.drawCalls). The device sums it across a frame's flushes.
-     */
+    /** Draw call count of the last `flush()` */
     public drawCalls = 0;
 
     constructor(gl: WebGL2RenderingContext) {
@@ -209,7 +182,6 @@ export class SpriteBatch {
         gl.bindVertexArray(vao);
         gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
 
-        // Set up per-instance attributes from INSTANCE_ATTRIBS; stride and divisor let the GPU fetch data per instance on its own
         const stride = FLOATS_PER_INSTANCE * 4;
         INSTANCE_ATTRIBS.forEach((attr, location) => {
             gl.enableVertexAttribArray(location);
@@ -226,45 +198,42 @@ export class SpriteBatch {
         return this.batches.items;
     }
 
-    /** Start a frame: reset instances, batches and the upload watermark (memory is not released) */
+    /** Start a frame: reset instances, batches, blend state and the upload watermark. */
     public begin(): void {
         this.instances.reset();
         this.batches.reset();
         this.uploaded = 0;
         this.drawCalls = 0;
+        this.setStraightBlend();
     }
 
-    /**
-     * Record one sprite.
-     *
-     * If the texture matches the previous batch it is merged into that batch, otherwise a new batch opens --
-     * so **sorting the input by texture** yields the fewest draw calls.
-     */
+    /** Restore straight-alpha blending; also used before vector draws change the layer. */
+    public setStraightBlend(): void {
+        this.gl.blendFunc(this.gl.SRC_ALPHA, this.gl.ONE_MINUS_SRC_ALPHA);
+        this.premultipliedBlend = false;
+    }
+
+    /** Record one sprite; same-texture draws merge into the current batch. */
     public draw(texture: Texture, call: SpriteDrawCall): void {
         const start = this.instances.count;
         this.instances.push(call);
         this.batches.add(texture, start);
     }
 
-    /**
-     * Set the projection matrix (world coordinates → clip space).
-     *
-     * Computed by `Renderer2D` from the camera and passed in.
-     */
+    /** Set the world → clip projection (computed from the camera by `Renderer2D`). */
     public setProjection(m: Mat3): void {
         this.projection.copyFrom(m);
     }
 
-    /** Actually submit the draw: upload the newly appended instances + one draw call per batch */
-    /** Number of sprite instances written this frame (for performance stats and benchmarks) */
+    /** Number of sprite instances written this frame */
     public get instanceCount(): number {
         return this.instances.count;
     }
 
+    /** Submit: upload the newly appended instances, then one draw per texture batch. */
     public flush(): void {
         const first = this.uploaded;
         const count = this.instances.count;
-        // Reset the per-flush counter even on the no-op path, so the device never re-adds the previous flush's calls
         this.drawCalls = 0;
         if (count <= first) return;
         const gl = this.gl;
@@ -277,34 +246,33 @@ export class SpriteBatch {
         gl.uniform1i(this.uTexture, 0);
 
         gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceVbo);
-        // Upload **only the newly appended range**. Re-uploading the whole written prefix per flush is
-        // what made GL uploads grow with the number of flushes; measured on a synthetic 500-flush frame
-        // (4 sprites each) this `bufferData` path issued **1000 store allocations for 164 KB** of payload
-        // (`packages/engine/tests/BatchUpload.test.ts`). Now the store is allocated at most a logarithmic number of
-        // times per frame and each byte is uploaded once, at a disjoint offset.
         const stride = FLOATS_PER_INSTANCE * 4;
         const offset = first * stride;
         const needed = count * stride;
         if (needed > this.glCapacityBytes) {
-            // Grow by doubling so the store is reused across every subsequent flush of the frame.
-            // `bufferData` orphans the old store, which is safe: the draws already encoded keep the old one.
+            // Orphan the old store and grow by doubling; already-encoded draws keep the old one.
             let cap = Math.max(1024, this.glCapacityBytes);
             while (cap < needed) cap *= 2;
             gl.bufferData(gl.ARRAY_BUFFER, cap, gl.DYNAMIC_DRAW);
             this.glCapacityBytes = cap;
         }
-        gl.bufferSubData(gl.ARRAY_BUFFER, offset, this.instances.data.subarray(first * FLOATS_PER_INSTANCE, count * FLOATS_PER_INSTANCE));
+        gl.bufferSubData(
+            gl.ARRAY_BUFFER,
+            offset,
+            this.instances.data.subarray(first * FLOATS_PER_INSTANCE, count * FLOATS_PER_INSTANCE),
+        );
 
-        // ⚠️ Key fix: instance attributes fetch by `gl_InstanceID`, and `gl_InstanceID`
-        // **restarts from 0 for every draw call**, so `drawArraysInstanced(..., batch.count)`
-        // would only ever read instances at the start of the buffer. With multiple textures you must **rebind the attribute pointers per batch.start**,
-        // otherwise the second batch re-reads the first batch's instance data.
-        //
-        // Symptom: perfectly fine with a single texture; but once a font and an atlas are mixed, the font batch draws
-        // the atlas sprite contents (showing up as "vertical bars where the text is"). This is a very subtle bug.
-        // `batch.start` is a **frame-absolute** instance index (the buffer accumulates for the whole frame).
         gl.activeTexture(gl.TEXTURE0);
         for (const batch of this.batches.items) {
+            const premultiplied = batch.texture.premultiplied === true;
+            if (premultiplied !== this.premultipliedBlend) {
+                if (premultiplied) {
+                    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+                } else {
+                    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+                }
+                this.premultipliedBlend = premultiplied;
+            }
             gl.bindTexture(gl.TEXTURE_2D, batch.texture.handle);
             const base = batch.start * stride;
             for (let i = 0; i < INSTANCE_ATTRIBS.length; i++) {
@@ -317,7 +285,7 @@ export class SpriteBatch {
 
         gl.bindVertexArray(null);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
-        // The instances stay in the buffer (frame-wide accumulation) -- only the consumed batches are dropped
+        // Instances stay in the buffer for the whole frame; only the consumed batches are dropped.
         this.uploaded = count;
         this.batches.reset();
     }

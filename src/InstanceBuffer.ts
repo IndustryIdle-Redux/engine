@@ -1,33 +1,15 @@
 /**
  * Data packer for instanced sprite batches (pure logic, no GL dependency).
  *
- * Why it is worth extracting on its own and unit-testing:
- *  This is exactly where the original Cocos version was most expensive -- it created **one `cc.Node` per sprite**
- *  (measured on a large save: 13,042 nodes, 10,000 of them overlay Labels taking 28.7 MB of heap).
- *  After switching to "one TypedArray + one `drawArraysInstanced`",
- *  the per-frame cost only depends on the **visible instance count**, not on the node count.
- *
- * So the correctness here (vertex order, UV, color normalization, capacity growth)
- * must be locked down by tests, not by eyeballing the rendered result.
- *
- * ### Instance data layout (16 floats per instance)
- *
- * | Offset | Meaning                                       |
- * |--------|-----------------------------------------------|
- * | 0,1    | World-space center (x, y)                     |
- * | 2,3    | Size (w, h), in pixels                        |
- * | 4,5    | Anchor (ax, ay), 0~1                          |
- * | 6,7    | Rotation (cos, sin)                           |
- * | 8,9    | Atlas UV top-left (u0, v0), normalized to 0~1 |
- * | 10,11  | Atlas UV size (du, dv)                        |
- * | 12-15  | Color RGBA, normalized to 0~1                 |
+ * Instance data layout, 16 floats per instance: center (2), size (2), anchor (2),
+ * rotation cos/sin (2), UV origin (2), UV size (2), RGBA (4).
  */
 
 import { Color } from "./Color";
 
 export const FLOATS_PER_INSTANCE = 16;
 
-/** Name and component count of each instance attribute in the vertex shader (used by the GL layer to set up the VAO) */
+/** Name, component count and float offset of each instance attribute */
 export const INSTANCE_ATTRIBS: ReadonlyArray<{ name: string; size: number; offset: number }> = (() => {
     const sizes = [
         { name: "a_center", size: 2 },
@@ -38,8 +20,7 @@ export const INSTANCE_ATTRIBS: ReadonlyArray<{ name: string; size: number; offse
         { name: "a_uvSize", size: 2 },
         { name: "a_color", size: 4 },
     ];
-    // offset is counted in **number of floats**, for the vertex attribute pointer;
-    // SpriteBatch needs it plus batch.start to recompute the pointer offset when drawing in per-texture batches.
+    // Offsets are in floats; SpriteBatch adds batch.start to rebuild the pointer per batch.
     let offset = 0;
     return sizes.map((a) => {
         const e = { ...a, offset };
@@ -72,12 +53,7 @@ export interface SpriteDrawCall {
     opacity?: number;
 }
 
-/**
- * Instance data buffer: capacity doubles on demand and **the same Float32Array is reused**.
- *
- * Key design: grow only when needed, and a normal frame only resets `count`,
- * so in steady state there are **zero allocations per frame** (GC pressure was one of the sources of the original version's 0.52%).
- */
+/** Instance data buffer: capacity doubles on demand and the backing array is reused. */
 export class InstanceBuffer {
     /** Raw float data, length = capacity × 16 */
     public data: Float32Array;
@@ -109,9 +85,8 @@ export class InstanceBuffer {
     }
 
     /**
-     * Write one sprite instance and return its starting float offset.
-     *
-     * Pure computation: no GL calls at all, so it can be asserted in Node.
+     * Write one sprite instance and return its starting float offset. Pure computation,
+     * no GL calls.
      */
     public push(call: SpriteDrawCall): number {
         this.ensure(1);
@@ -136,22 +111,9 @@ export class InstanceBuffer {
         d[o + 9] = call.v0 ?? 0;
         d[o + 10] = call.du ?? 1;
         d[o + 11] = call.dv ?? 1;
-        /**
-         * Color normalized to 0~1; **opacity applies to alpha only, do NOT premultiply it into RGB**.
-         *
-         * ⚠️ This is a serious bug that used to exist: the original implementation also multiplied RGB by `opacity/255`,
-         * while the renderer's blend mode is `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` (**straight-through alpha**,
-         * see `WebGL2Device.ts:38` and `WebGPUDevice.beginFrame`'s blend state) -- so the alpha in the vertex color gets multiplied **a second time**,
-         * and the actual contribution becomes `opacity²`.
-         *
-         * Symptom: every draw with `opacity < 255` was disproportionately dark. Most obvious is the
-         * **negative (red) value of the tile-modifier overlay**: the original uses `opacity = 55 + 200·percent`,
-         * so for a negative modifier `percent→0` ⇒ opacity 55 (21%), which was already deliberately faint;
-         * after premultiplying only `0.216² = 4.7%` remained, i.e. **4.6× darker**, practically invisible.
-         *
-         * Cocos's equivalent implementation writes opacity into vertex alpha only (`v_color = (r,g,b,a·opacity)`),
-         * leaving RGB as-is -- this aligns with it.
-         */
+        // Opacity applies to alpha only. Premultiplying RGB here would apply it twice
+        // (the blend is straight alpha), making translucent sprites too dark.
+
         const op = opacity / 255;
         d[o + 12] = color ? color.r / 255 : 1;
         d[o + 13] = color ? color.g / 255 : 1;

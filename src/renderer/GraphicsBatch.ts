@@ -1,23 +1,9 @@
 /**
- * Vector graphics renderer — replaces Cocos's `cc.Graphics`.
+ * Vector graphics batch: solid triangles with a per-vertex colour.
  *
- * ### Key differences from the original implementation
- * `cc.Graphics` is "imperative path + immediate rebuild":
- * every `stroke()` re-tessellates the path and rebuilds the dynamic vertex buffer.
- * The original's `drawGrid` calls `stroke()` once per hexagon for 10,000 hexagons → **13~15 ms** per call.
- *
- * Here the two are separated:
- *  - **geometry generation** is a pure function (`tessellate.ts` / `GridGeometry.ts`), cacheable
- *  - **GPU submission** only writes the existing triangles into one buffer and issues a single `drawArrays`
- *
- * So static geometry (grid lines) can be "generated once and re-submitted without regenerating":
- * the grid geometry cache lives in `WorldRenderer.drawGrid` (keyed on the quantized visible rect), and
- * this batch only re-expands the cached segments into vertices. There is deliberately no
- * `setStaticGeometry()`: uploading a static vertex buffer is a property of the *caller's* data, not of
- * this dynamic batch, and the geometry cache above already removes the repeat cost.
- *
- * ### Vertex format (6 floats per vertex)
- * `x, y, r, g, b, a` — vertices carry their own color, so **shapes of different colors can be merged into a single draw call**.
+ * Geometry generation lives in `tessellate.ts` / `GridGeometry.ts` (pure, cacheable); this class
+ * only appends the resulting vertices and submits one `drawArrays`. Vertices carry their own
+ * colour so differently coloured shapes can share a draw call.
  */
 
 import { Color } from "../Color";
@@ -68,11 +54,8 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLSh
     return s;
 }
 
-/**
- * Dynamic triangle batch: vertices carry their own color, one upload and one draw.
- *
- * Zero allocation in steady state: `begin()` only resets the counters, and the buffer doubles on demand.
- */
+/** Dynamic triangle batch: one upload and one draw per flush. */
+
 export class GraphicsBatch {
     private readonly gl: WebGL2RenderingContext;
     private readonly program: WebGLProgram;
@@ -87,15 +70,11 @@ export class GraphicsBatch {
     public drawCalls = 0;
 
     /**
-     * Vertices already uploaded and drawn this frame (the **upload watermark**).
-     *
-     * `flush()` uploads only `[uploaded, vertexCount)` and draws only that range, so successive flushes
-     * write **disjoint** buffer ranges and every vertex is uploaded exactly once per frame. The previous
-     * implementation reset the batch on every flush and uploaded its chunk with `bufferData`, i.e. one
-     * GPU store allocation per layer switch (see `packages/engine/tests/BatchUpload.test.ts` for the measurement).
+     * Vertices already uploaded this frame. `flush()` uploads only `[uploaded, vertexCount)` so
+     * successive flushes write disjoint ranges and every vertex is uploaded exactly once.
      */
     private uploaded = 0;
-    /** GPU data-store size in bytes; `bufferData` runs only when growing, never once per flush */
+    /** GPU data-store size in bytes; `bufferData` runs only when growing */
     private glCapacityBytes = 0;
 
     constructor(gl: WebGL2RenderingContext, initialVertices = 4096) {
@@ -155,10 +134,10 @@ export class GraphicsBatch {
     }
 
     /**
-     * Append a batch of triangle vertices (`[x0,y0,x1,y1,...]`, one triangle per 3 vertices).
+     * Append triangle vertices (`[x0,y0,x1,y1,...]`, one triangle per 3 vertices).
      *
      * @param vertices expanded triangle vertices (from `tessellate.ts`)
-     * @param color uniform color; white is used when omitted
+     * @param color uniform colour; white when omitted
      */
     public addTriangles(
         vertices: ReadonlyArray<number> | Float32Array,
@@ -185,8 +164,7 @@ export class GraphicsBatch {
                 d[o++] = a;
             }
         } else {
-            // With translation: for reusing "a template of the same shape" across many tiles (overlay fills),
-            // it saves a triangulatePolygon array allocation and the ear-clip computation per tile.
+            // Translation avoids re-triangulating the same template for every tile.
             for (let i = 0; i < n; i++) {
                 d[o++] = (vertices[i * 2] as number) + offsetX;
                 d[o++] = (vertices[i * 2 + 1] as number) + offsetY;
@@ -199,15 +177,9 @@ export class GraphicsBatch {
         this.vertexCount += n;
     }
 
-    /**
-     * Append one line segment (expanded internally into a quad with width).
-     *
-     * For anything but a single segment use `addSegments`, which writes straight into the buffer with no
-     * intermediate array. (This used to take a `vertices?` parameter that was silently discarded via
-     * `void vertices` — a scratch-buffer idea that never got used and only made the API misleading.)
-     */
+    /** Append one line segment, expanded into a quad with the given width. */
     public addLine(x0: number, y0: number, x1: number, y1: number, width: number, color?: Color): void {
-        // Avoid a dependency cycle with tessellate: expand a single segment here directly (equivalent to strokeSegments' single-segment branch)
+        // Expanded here directly to avoid a dependency cycle with tessellate.
         const dx = x1 - x0;
         const dy = y1 - y0;
         const len = Math.hypot(dx, dy);
@@ -223,13 +195,8 @@ export class GraphicsBatch {
     }
 
     /**
-     * Expand a batch of line segments into stroke triangles straight into the buffer (**no intermediate array**).
-     *
-     * Replaces `addTriangles(strokeSegments(...))`: the latter builds an intermediate array of
-     * 12 numbers per segment — with 5,723 grid lines that is a **temporary array of 68,676 numbers**,
-     * allocated once per frame, the main cost of the grid stage.
-     *
-     * Here 6 vertices are computed in place per segment and written into the `Float32Array`, with zero intermediate allocation.
+     * Expand line segments into stroke triangles straight into the buffer, with no intermediate
+     * array (grid lines can number in the thousands per frame).
      */
     public addSegments(
         segments: ReadonlyArray<{ x0: number; y0: number; x1: number; y1: number }>,
@@ -237,7 +204,7 @@ export class GraphicsBatch {
         color?: Color,
     ): void {
         if (segments.length === 0 || width <= 0) return;
-        // Reserve capacity by the upper bound first (degenerate segments are skipped, so fewer vertices may actually be written)
+        // Reserve by the upper bound; degenerate segments are skipped and write fewer vertices.
         this.ensureVertices(segments.length * 6);
         const d = this.data;
         const half = width / 2;
@@ -248,7 +215,6 @@ export class GraphicsBatch {
         let o = this.vertexCount * FLOATS_PER_VERTEX;
         let written = 0;
 
-        /** Write one vertex */
         const put = (x: number, y: number): void => {
             d[o++] = x;
             d[o++] = y;
@@ -299,8 +265,8 @@ export class GraphicsBatch {
         projection.toMat3Array(this.projectionArray);
         gl.uniformMatrix3fv(this.uProjection, false, this.projectionArray);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
-        // Reserve the store only when this frame outgrows it; afterwards every flush is a plain
-        // `bufferSubData` into a disjoint range (see the `uploaded` field for why disjointness matters).
+        // Grow the store only when the frame outgrows it; otherwise each flush is a plain
+        // `bufferSubData` into a disjoint range (see `uploaded`).
         const stride = FLOATS_PER_VERTEX * 4;
         const needed = this.vertexCount * stride;
         if (needed > this.glCapacityBytes) {
@@ -314,7 +280,7 @@ export class GraphicsBatch {
             first * stride,
             this.data.subarray(first * FLOATS_PER_VERTEX, this.vertexCount * FLOATS_PER_VERTEX),
         );
-        // `firstVertex` is relative to the bound buffer, so the VAO's attribute pointers (offset 0) stay valid
+        // `firstVertex` is relative to the bound buffer, so the VAO's attribute pointers stay valid.
         gl.drawArrays(gl.TRIANGLES, first, count);
         this.drawCalls++;
 
@@ -323,12 +289,12 @@ export class GraphicsBatch {
         this.uploaded = this.vertexCount;
     }
 
-    /** current number of pending vertices (debug/test) */
-    /** number of triangles submitted this frame (for perf stats) */
+    /** Number of triangles submitted this frame */
     public get triangleCount(): number {
         return this.vertexCount / 3;
     }
 
+    /** Current number of pending vertices (test/debug) */
     public get pendingVertices(): number {
         return this.vertexCount;
     }

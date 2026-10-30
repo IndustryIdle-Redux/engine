@@ -11,6 +11,30 @@ function makeCamera(): Camera2D {
     return c;
 }
 
+describe("Camera2D zoom clamp", () => {
+    it("clamps zero and negative zoom to a small positive minimum", () => {
+        const c = makeCamera();
+        c.zoom = 0;
+        expect(c.zoom).toBeGreaterThan(0);
+        expect(c.zoom).toBeLessThanOrEqual(1e-3);
+        c.zoom = -2;
+        expect(c.zoom).toBeGreaterThan(0);
+        c.zoom = Number.NaN;
+        expect(Number.isFinite(c.zoom)).toBe(true);
+        c.zoom = 2;
+        expect(c.zoom).toBe(2);
+    });
+
+    it("keeps the visible rect and projection finite at the minimum", () => {
+        const c = makeCamera();
+        c.zoom = 0;
+        const rect = c.getVisibleRect();
+        expect(Number.isFinite(rect.width)).toBe(true);
+        expect(Number.isFinite(rect.height)).toBe(true);
+        expect(Number.isFinite(c.updateProjection().transformPoint(0, 0).x)).toBe(true);
+    });
+});
+
 describe("Camera2D projection", () => {
     it("with the camera at the origin and zoom=1, the viewport center maps to the NDC origin", () => {
         const c = makeCamera();
@@ -103,7 +127,7 @@ describe("Camera2D coordinate conversion", () => {
     });
 });
 
-describe("Camera2D visibility tests (replaces Cocos isRectInView)", () => {
+describe("Camera2D visibility tests", () => {
     it("the visible rect equals viewport size / zoom", () => {
         const c = makeCamera();
         c.zoom = 2;

@@ -1,23 +1,17 @@
 /**
- * Batch offset regression test.
+ * Instance layout and batch offset tests.
  *
- * Background (a pit we really fell into): in `SpriteBatch.flush()`
- *   `gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, batch.count)`
- * ignores `batch.start`. Instance attributes are fetched via `gl_InstanceID`, and
- * `gl_InstanceID` **restarts at 0 for every draw call** --
- * so the second texture's batch reads instance data from the start of the buffer.
+ * Instance attributes are fetched by `gl_InstanceID`, which restarts at 0 for every draw, so
+ * `flush()` must rebind the attribute pointers to `batch.start * stride`. If it does not, the
+ * second texture's batch draws the first batch's instances (atlas content where text should be).
  *
- * Symptom: with a single texture the frame looks perfectly fine; as soon as atlas and font are mixed,
- * **the font batch draws the atlas sprites' content** (showing up as vertical bars where the text should be).
- *
- * This locks down two things:
- *  1. `INSTANCE_ATTRIBS` offsets accumulate, and their total equals `FLOATS_PER_INSTANCE`
- *  2. the `start`/`count` recorded by batch splitting is correct (this is the only basis for rebinding pointers)
+ * Covered here: the `INSTANCE_ATTRIBS` offsets/total and the `start`/`count` recorded by batch
+ * splitting.
  */
 
 import { describe, expect, it } from "vitest";
 import { INSTANCE_ATTRIBS, FLOATS_PER_INSTANCE } from "../src/InstanceBuffer";
-import { BatchList, SHADER_ATTRIBUTE_COUNT } from "../src/renderer/SpriteBatch";
+import { BatchList, VERTEX_SHADER_SOURCE } from "../src/renderer/SpriteBatch";
 
 describe("INSTANCE_ATTRIBS layout", () => {
     it("offsets accumulate item by item with no holes", () => {
@@ -30,7 +24,8 @@ describe("INSTANCE_ATTRIBS layout", () => {
     });
 
     it("the attribute count matches the shader layout count", () => {
-        expect(INSTANCE_ATTRIBS.length).toBe(SHADER_ATTRIBUTE_COUNT);
+        const locations = VERTEX_SHADER_SOURCE.match(/layout\(location = \d+\)/g) ?? [];
+        expect(INSTANCE_ATTRIBS.length).toBe(locations.length);
     });
 
     it("the last item is a 4-component color", () => {
@@ -58,7 +53,7 @@ describe("Batch splitting (flush relies on start/count to rebind attribute point
         expect(list.items[2]).toMatchObject({ texture: texA, start: 5, count: 1 });
     });
 
-    it("start strictly increases and covers exactly all instances (flush uses it to compute the pointer offset)", () => {
+    it("start strictly increases and covers exactly all instances", () => {
         const list = new BatchList();
         let n = 0;
         for (let i = 0; i < 50; i++) {
@@ -80,9 +75,7 @@ describe("Batch splitting (flush relies on start/count to rebind attribute point
         expect(list.items[0]).toMatchObject({ start: 0, count: 10 });
     });
 
-    it("regression: with multiple textures the 2nd batch's start must be > 0", () => {
-        // This was exactly the bug: flush ignored start, so the second batch re-read instance 0,
-        // showing up as "vertical bars of atlas content where the font should be".
+    it("with multiple textures the 2nd batch's start must be > 0", () => {
         const list = new BatchList();
         list.add(texA, 0);
         list.add(texB, 1);

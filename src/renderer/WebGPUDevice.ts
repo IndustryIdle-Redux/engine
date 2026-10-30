@@ -1,48 +1,49 @@
 /// <reference types="@webgpu/types" />
 /**
- * WebGPU render device — the **primary backend** (aggressive optimisation target).
+ * WebGPU render device.
  *
- * v1 mirrors the WebGL2 backend semantics exactly (same 16-float instance layout via the shared
- * `InstanceBuffer`, same non-premultiplied blending, same call-order-preserving layer flushes),
- * so the two backends are drop-in interchangeable behind `Renderer2D`.
+ * Frame data is staged once per frame and each flush uploads only its own disjoint range:
+ * `queue.writeBuffer` is not stream-ordered, so reusing an offset per flush would make every
+ * draw of the frame read the last write.
  *
- * What the WebGPU backend buys over WebGL2 even at parity:
- *  - one render pass per frame instead of independent GL draw state juggling
- *  - `queue.writeBuffer` of only the used range, with no VAO rebinding dance per texture batch
- * and the door is open for the aggressive moves (compute density passes, cached static buffers,
- * compact instance formats) — those build on this class.
+ * Creation runs all resource creation inside a validation error scope before the canvas is
+ * bound, so a driver that rejects a pipeline still leaves the canvas available for the WebGL2
+ * fallback. A lost device can be rebuilt with `recover()`.
  */
 
 import { Color } from "../Color";
 import type { Mat3 } from "../Mat3";
 import { BatchList, type Batch } from "./SpriteBatch";
 import { InstanceBuffer, INSTANCE_ATTRIBS, FLOATS_PER_INSTANCE, type SpriteDrawCall } from "../InstanceBuffer";
-import type { RenderDevice, RenderTexture, Segment, TextureOptions } from "./RenderDevice";
+import { assertTextureSize } from "./RenderDevice";
+import type { RenderDevice, RenderTexture, Segment, TextureOptions, TextureSource } from "./RenderDevice";
 
 type Layer = "sprite" | "vector" | null;
 
-const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a (same packing as GraphicsBatch)
+const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
+
+export interface WebGPUDeviceOptions {
+    alpha?: boolean;
+    antialias?: boolean;
+}
 
 class GpuTexture implements RenderTexture {
-    public readonly width: number;
-    public readonly height: number;
+    public readonly kind = "webgpu" as const;
+    public texture: GPUTexture;
+    public width: number;
+    public height: number;
+    public premultiplied: boolean;
+    public sampler: GPUSampler;
     public bindGroup: GPUBindGroup | null = null;
-    constructor(
-        public readonly texture: GPUTexture,
-        width: number,
-        height: number,
-        /**
-         * Sampler created from this texture's `TextureOptions`.
-         *
-         * The WebGL2 backend honours `linear` / `wrap` / `premultiplyAlpha` (`Texture.fromImage`); this
-         * backend used to ignore them and hardcode linear + clamp-to-edge, so the same call produced
-         * different sampling on the two backends. The sampler is per texture (cached by filter/address
-         * mode) because a WebGPU bind group fixes the sampler, unlike GL's per-texture parameters.
-         */
-        public readonly sampler: GPUSampler,
-    ) {
-        this.width = width;
-        this.height = height;
+    public source: TextureSource;
+
+    constructor(texture: GPUTexture, sampler: GPUSampler, source: TextureSource) {
+        this.texture = texture;
+        this.sampler = sampler;
+        this.source = source;
+        this.width = source.width;
+        this.height = source.height;
+        this.premultiplied = source.options.premultiplyAlpha === true;
     }
 }
 
@@ -126,47 +127,44 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
 
 export class WebGPUDevice implements RenderDevice {
     public readonly kind = "webgpu" as const;
+    public onLost: (() => void) | null = null;
 
-    private readonly spritePipeline: GPURenderPipeline;
-    private readonly vectorPipeline: GPURenderPipeline;
-    private readonly projBuffer: GPUBuffer;
-    private readonly sampler: GPUSampler;
-    /** Samplers keyed by `linear|wrap`, so the two texture-option combinations share one GPU sampler */
+    private device: GPUDevice;
+    private context: GPUCanvasContext | null;
+    private readonly format: GPUTextureFormat;
+    private readonly antialias: boolean;
+    private readonly alphaMode: GPUCanvasAlphaMode;
+    private lost = false;
+    private disposed = false;
+
+    private spritePipelines!: { straight: GPURenderPipeline; premultiplied: GPURenderPipeline };
+    private vectorPipeline!: GPURenderPipeline;
+    private projBuffer!: GPUBuffer;
+    private sampler!: GPUSampler;
     private readonly samplerCache = new Map<string, GPUSampler>();
-    private readonly bindGroupLayout: GPUBindGroupLayout;
-    private readonly vectorBindGroup: GPUBindGroup;
+    private bindGroupLayout!: GPUBindGroupLayout;
+    private vectorBindGroup!: GPUBindGroup;
 
-    /** shared instance packing (16 floats/instance — the WebGL2 layout) */
+    /** shared instance packing (16 floats per instance, same layout as WebGL2) */
     private readonly instances = new InstanceBuffer(1024);
-    private instanceBuffer: GPUBuffer;
+    private instanceBuffer!: GPUBuffer;
     private instanceCapacity = 1024;
-    /**
-     * Frame-wide sprite staging (see `flushSprites`).
-     *
-     * ⚠️ `queue.writeBuffer` is **not** a draw-time upload: every write enqueued before a submit is
-     * applied *before* that submit's commands execute. Writing the frame's instances into the same
-     * buffer once per flush therefore makes **every** draw of the frame read the **last** write
-     * (the earlier flushes' draws render garbage). So the instances accumulate for the whole frame
-     * and each flush writes only its own disjoint range:
-     *  - `instanceBase` — frame index the data currently in the GPU buffer starts at
-     *  - `instanceUploaded` — frame index already written to the GPU buffer
-     */
     private instanceBase = 0;
     private instanceUploaded = 0;
-    /** whether a sprite draw has already been encoded this frame (the buffer is then referenced) */
     private spriteEncoded = false;
-    /** instance count of the last completed frame — sizes the buffer before the frame starts */
     private lastFrameInstances = 0;
 
     private vectorData = new Float32Array(4096 * FLOATS_PER_VERTEX);
     private vectorVertices = 0;
-    private vectorBuffer: GPUBuffer;
-    /** same frame-wide accumulation rule as the sprite instances (`instanceBase`) */
+    private vectorBuffer!: GPUBuffer;
     private vectorCapacity = 4096;
     private vectorBase = 0;
     private vectorUploaded = 0;
     private vectorEncoded = false;
     private lastFrameVectorVertices = 0;
+
+    /** Buffers replaced mid-frame; destroyed after the frame's submit hands them to the GPU. */
+    private retiredBuffers: GPUBuffer[] = [];
 
     private readonly batches = new BatchList();
     private layer: Layer = null;
@@ -176,13 +174,127 @@ export class WebGPUDevice implements RenderDevice {
 
     private pass: GPURenderPassEncoder | null = null;
     private encoder: GPUCommandEncoder | null = null;
-    private disposed = false;
+
+    private msaaTexture: GPUTexture | null = null;
+    private msaaWidth = 0;
+    private msaaHeight = 0;
+
+    private readonly textures = new Set<GpuTexture>();
 
     private constructor(
-        private readonly device: GPUDevice,
-        private readonly context: GPUCanvasContext,
+        device: GPUDevice,
+        context: GPUCanvasContext | null,
         format: GPUTextureFormat,
+        options: WebGPUDeviceOptions = {},
     ) {
+        this.device = device;
+        this.context = context;
+        this.format = format;
+        this.antialias = options.antialias !== false;
+        this.alphaMode = options.alpha === true ? "premultiplied" : "opaque";
+        this.buildResources();
+        this.watchLost(device);
+        if (context) this.configureContext();
+    }
+
+    /** async factory (GPUDevice acquisition is async; the facade picks the backend at boot) */
+    public static async create(
+        canvas: HTMLCanvasElement,
+        options: WebGPUDeviceOptions = {},
+    ): Promise<WebGPUDevice | null> {
+        const gpu = globalThis.navigator?.gpu;
+        if (!gpu) return null;
+        const adapter = await gpu.requestAdapter().catch(() => null);
+        if (!adapter) return null;
+        const device = await adapter.requestDevice().catch(() => null);
+        if (!device) return null;
+
+        // Build every resource inside the validation scope, before touching the canvas: once
+        // getContext("webgpu") succeeds the canvas can no longer hand out a WebGL2 context.
+        device.pushErrorScope("validation");
+        let probe: WebGPUDevice | null = null;
+        try {
+            probe = new WebGPUDevice(device, null, gpu.getPreferredCanvasFormat(), options);
+        } catch {
+            probe = null;
+        }
+        let failed = false;
+        let error: GPUError | null = null;
+        try {
+            error = await device.popErrorScope();
+        } catch {
+            failed = true;
+        }
+        if (failed || !probe || error) {
+            device.destroy();
+            return null;
+        }
+
+        const context = canvas.getContext("webgpu");
+        if (!context) {
+            device.destroy();
+            return null;
+        }
+        probe.context = context;
+        try {
+            probe.configureContext();
+        } catch {
+            device.destroy();
+            return null;
+        }
+        return probe;
+    }
+
+    public get isLost(): boolean {
+        return this.lost;
+    }
+
+    public get drawCalls(): number {
+        return this.totals.drawCalls;
+    }
+    public get instanceCount(): number {
+        return this.totals.instances;
+    }
+    public get triangleCount(): number {
+        return this.totals.triangles;
+    }
+
+    public resize(pixelWidth: number, pixelHeight: number): void {
+        // The MSAA attachment tracks the swap-chain size; rebuild it on the next frame.
+        if (this.msaaWidth !== pixelWidth || this.msaaHeight !== pixelHeight) {
+            this.msaaWidth = pixelWidth;
+            this.msaaHeight = pixelHeight;
+            this.releaseMsaa();
+        }
+    }
+
+    /* ---------------- device lifecycle ---------------- */
+
+    private watchLost(device: GPUDevice): void {
+        device.lost.then(
+            () => {
+                if (this.disposed || this.device !== device) return;
+                this.lost = true;
+                this.layer = null;
+                this.pass = null;
+                this.encoder = null;
+                this.onLost?.();
+            },
+            () => {},
+        );
+    }
+
+    private configureContext(): void {
+        this.context?.configure({ device: this.device, format: this.format, alphaMode: this.alphaMode });
+    }
+
+    /** (Re)create pipelines, buffers and bind groups for the current device. */
+    private buildResources(): void {
+        const device = this.device;
+        this.samplerCache.clear();
+        this.releaseMsaa();
+        this.retiredBuffers = [];
+
         this.projBuffer = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.sampler = device.createSampler({
             magFilter: "linear",
@@ -199,10 +311,66 @@ export class WebGPUDevice implements RenderDevice {
             ],
         });
 
-        this.spritePipeline = device.createRenderPipeline({
-            layout: device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
+        const spriteModule = device.createShaderModule({ code: SPRITE_SHADER });
+        const spriteLayout = device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] });
+        this.spritePipelines = {
+            straight: this.createSpritePipeline(device, spriteModule, spriteLayout, false),
+            premultiplied: this.createSpritePipeline(device, spriteModule, spriteLayout, true),
+        };
+
+        const vectorModule = device.createShaderModule({ code: VECTOR_SHADER });
+        const vectorLayout = device.createBindGroupLayout({
+            entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } }],
+        });
+        this.vectorPipeline = device.createRenderPipeline({
+            layout: device.createPipelineLayout({ bindGroupLayouts: [vectorLayout] }),
             vertex: {
-                module: device.createShaderModule({ code: SPRITE_SHADER }),
+                module: vectorModule,
+                entryPoint: "vs",
+                buffers: [
+                    {
+                        arrayStride: FLOATS_PER_VERTEX * 4,
+                        stepMode: "vertex",
+                        attributes: [
+                            { shaderLocation: 0, offset: 0, format: "float32x2" },
+                            { shaderLocation: 1, offset: 8, format: "float32x4" },
+                        ],
+                    },
+                ],
+            },
+            fragment: {
+                module: vectorModule,
+                entryPoint: "fs",
+                targets: [{ format: this.format, blend: this.blendState(false) }],
+            },
+            primitive: { topology: "triangle-list" },
+            multisample: { count: this.antialias ? 4 : 1 },
+        });
+        this.vectorBindGroup = device.createBindGroup({
+            layout: vectorLayout,
+            entries: [{ binding: 0, resource: { buffer: this.projBuffer } }],
+        });
+
+        this.instanceBuffer = device.createBuffer({
+            size: this.instanceCapacity * FLOATS_PER_INSTANCE * 4,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        this.vectorBuffer = device.createBuffer({
+            size: this.vectorCapacity * FLOATS_PER_VERTEX * 4,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+    }
+
+    private createSpritePipeline(
+        device: GPUDevice,
+        module: GPUShaderModule,
+        layout: GPUPipelineLayout,
+        premultiplied: boolean,
+    ): GPURenderPipeline {
+        return device.createRenderPipeline({
+            layout,
+            vertex: {
+                module,
                 entryPoint: "vs",
                 buffers: [
                     {
@@ -217,103 +385,110 @@ export class WebGPUDevice implements RenderDevice {
                 ],
             },
             fragment: {
-                module: device.createShaderModule({ code: SPRITE_SHADER }),
+                module,
                 entryPoint: "fs",
-                targets: [
-                    {
-                        format,
-                        // ⚠️ without this blend state the pipeline REPLACES the framebuffer, so the
-                        // transparent texels of every atlas sprite paint solid black (matches the
-                        // GL backend's SRC_ALPHA / ONE_MINUS_SRC_ALPHA)
-                        blend: {
-                            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
-                            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
-                        },
-                    },
-                ],
+                targets: [{ format: this.format, blend: this.blendState(premultiplied) }],
             },
             primitive: { topology: "triangle-list" },
-        });
-
-        // vector pipeline: interleaved x,y,r,g,b,a
-        const vecLayout = device.createBindGroupLayout({
-            entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } }],
-        });
-        this.vectorPipeline = device.createRenderPipeline({
-            layout: device.createPipelineLayout({ bindGroupLayouts: [vecLayout] }),
-            vertex: {
-                module: device.createShaderModule({ code: VECTOR_SHADER }),
-                entryPoint: "vs",
-                buffers: [
-                    {
-                        arrayStride: FLOATS_PER_VERTEX * 4,
-                        stepMode: "vertex",
-                        attributes: [
-                            { shaderLocation: 0, offset: 0, format: "float32x2" },
-                            { shaderLocation: 1, offset: 8, format: "float32x4" },
-                        ],
-                    },
-                ],
-            },
-            fragment: {
-                module: device.createShaderModule({ code: VECTOR_SHADER }),
-                entryPoint: "fs",
-                targets: [
-                    {
-                        format,
-                        blend: {
-                            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
-                            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
-                        },
-                    },
-                ],
-            },
-            primitive: { topology: "triangle-list" },
-        });
-        this.vectorBindGroup = device.createBindGroup({
-            layout: vecLayout,
-            entries: [{ binding: 0, resource: { buffer: this.projBuffer } }],
-        });
-
-        this.instanceBuffer = device.createBuffer({
-            size: this.instanceCapacity * FLOATS_PER_INSTANCE * 4,
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-        });
-        this.vectorBuffer = device.createBuffer({
-            size: this.vectorData.byteLength,
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            multisample: { count: this.antialias ? 4 : 1 },
         });
     }
 
-    /** async factory (GPUDevice acquisition is async; the facade picks the backend at boot) */
-    public static async create(canvas: HTMLCanvasElement): Promise<WebGPUDevice | null> {
-        if (!globalThis.navigator?.gpu) return null;
-        const adapter = await navigator.gpu.requestAdapter().catch(() => null);
-        if (!adapter) return null;
+    private blendState(premultiplied: boolean): GPUBlendState {
+        return {
+            color: premultiplied
+                ? { srcFactor: "one", dstFactor: "one-minus-src-alpha" }
+                : { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+        };
+    }
+
+    private ensureMsaa(width: number, height: number): GPUTexture {
+        if (this.msaaTexture && this.msaaWidth === width && this.msaaHeight === height) return this.msaaTexture;
+        this.releaseMsaa();
+        this.msaaWidth = width;
+        this.msaaHeight = height;
+        this.msaaTexture = this.device.createTexture({
+            size: [width, height],
+            format: this.format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+            sampleCount: 4,
+        });
+        return this.msaaTexture;
+    }
+
+    private releaseMsaa(): void {
+        this.msaaTexture?.destroy();
+        this.msaaTexture = null;
+    }
+
+    /** Reset all per-frame bookkeeping (also after a device rebuild). */
+    private resetFrameState(): void {
+        this.instances.reset();
+        this.batches.reset();
+        this.instanceBase = 0;
+        this.instanceUploaded = 0;
+        this.spriteEncoded = false;
+        this.lastFrameInstances = 0;
+        this.vectorVertices = 0;
+        this.vectorBase = 0;
+        this.vectorUploaded = 0;
+        this.vectorEncoded = false;
+        this.lastFrameVectorVertices = 0;
+        this.layer = null;
+        this.pass = null;
+        this.encoder = null;
+        this.totals = { drawCalls: 0, instances: 0, triangles: 0 };
+    }
+
+    public async recover(): Promise<boolean> {
+        if (this.disposed) return false;
+        if (!this.lost) return true;
+        const gpu = globalThis.navigator?.gpu;
+        if (!gpu) return false;
+        const adapter = await gpu.requestAdapter().catch(() => null);
+        if (!adapter) return false;
         const device = await adapter.requestDevice().catch(() => null);
-        if (!device) return null;
-        const context = canvas.getContext("webgpu");
-        if (!context) return null;
-        const format = navigator.gpu.getPreferredCanvasFormat();
-        context.configure({ device, format, alphaMode: "opaque" });
-        return new WebGPUDevice(device, context, format);
+        if (!device) return false;
+
+        this.device.destroy();
+        this.device = device;
+        device.pushErrorScope("validation");
+        try {
+            this.buildResources();
+            this.configureContext();
+        } catch {
+            device.destroy();
+            return false;
+        }
+        let failed = false;
+        let error: GPUError | null = null;
+        try {
+            error = await device.popErrorScope();
+        } catch {
+            failed = true;
+        }
+        if (failed || error) {
+            device.destroy();
+            return false;
+        }
+
+        this.watchLost(device);
+        for (const texture of this.textures) {
+            texture.texture = this.createGpuTexture(texture.width, texture.height);
+            texture.sampler = this.samplerFor(texture.source.options);
+            texture.bindGroup = null;
+            this.uploadTexture(texture);
+        }
+        this.resetFrameState();
+        this.lost = false;
+        return true;
     }
 
-    public get drawCalls(): number {
-        return this.totals.drawCalls;
-    }
-    public get instanceCount(): number {
-        return this.totals.instances;
-    }
-    public get triangleCount(): number {
-        return this.totals.triangles;
-    }
-
-    public resize(_pixelWidth: number, _pixelHeight: number): void {
-        // the canvas context follows the canvas size automatically
-    }
+    /* ---------------- frame ---------------- */
 
     public beginFrame(clearColor: Color | undefined, projection: Mat3): void {
+        if (this.lost) return;
         this.totals = { drawCalls: 0, instances: 0, triangles: 0 };
         this.instances.reset();
         this.batches.reset();
@@ -325,12 +500,12 @@ export class WebGPUDevice implements RenderDevice {
         this.vectorUploaded = 0;
         this.vectorEncoded = false;
         this.layer = null;
-        // Size the GPU buffers for this frame while nothing references them yet: the previous frame
-        // reports what a frame needs, and a frame that outgrows it rotates to a fresh buffer mid-frame.
+        // Size buffers for this frame while nothing references them; a frame that outgrows the
+        // previous one rotates to a fresh buffer mid-frame.
         this.reserveInstanceCapacity(this.lastFrameInstances);
         this.reserveVectorCapacity(this.lastFrameVectorVertices);
 
-        // mat3x3 in WGSL is column-major with 16B column stride; copy each of Mat3's three columns into a vec3 slot
+        // mat3x3 in WGSL is column-major with a 16-byte column stride
         const m = projection.toMat3Array(this.projScratch);
         const p = this.projArray;
         for (let col = 0; col < 3; col++) {
@@ -342,20 +517,30 @@ export class WebGPUDevice implements RenderDevice {
         this.device.queue.writeBuffer(this.projBuffer, 0, p.buffer, p.byteOffset, 48);
 
         const c = clearColor ?? new Color(0, 0, 0, 0);
+        const clearValue = { r: c.r / 255, g: c.g / 255, b: c.b / 255, a: c.a / 255 };
+        const context = this.context;
+        if (!context) return;
+        const current = context.getCurrentTexture();
         this.encoder = this.device.createCommandEncoder();
-        this.pass = this.encoder.beginRenderPass({
-            colorAttachments: [
-                {
-                    view: this.context.getCurrentTexture().createView(),
-                    clearValue: { r: c.r / 255, g: c.g / 255, b: c.b / 255, a: c.a / 255 },
-                    loadOp: "clear",
-                    storeOp: "store",
-                },
-            ],
-        });
+        const colorAttachment: GPURenderPassColorAttachment = this.antialias
+            ? {
+                  view: this.ensureMsaa(current.width, current.height).createView(),
+                  resolveTarget: current.createView(),
+                  clearValue,
+                  loadOp: "clear",
+                  storeOp: "discard",
+              }
+            : {
+                  view: current.createView(),
+                  clearValue,
+                  loadOp: "clear",
+                  storeOp: "store",
+              };
+        this.pass = this.encoder.beginRenderPass({ colorAttachments: [colorAttachment] });
     }
 
     public endFrame(): void {
+        if (this.lost) return;
         if (this.layer === "vector") this.flushVectors();
         if (this.layer === "sprite") this.flushSprites();
         this.layer = null;
@@ -365,7 +550,9 @@ export class WebGPUDevice implements RenderDevice {
             this.device.queue.submit([this.encoder.finish()]);
             this.encoder = null;
         }
-        // remember the frame's size so `beginFrame` can size the buffers before the next frame starts
+        // The submit keeps replaced buffers alive until the GPU is done with them.
+        for (const buffer of this.retiredBuffers) buffer.destroy();
+        this.retiredBuffers.length = 0;
         this.lastFrameInstances = this.instances.count;
         this.lastFrameVectorVertices = this.vectorVertices;
     }
@@ -373,10 +560,8 @@ export class WebGPUDevice implements RenderDevice {
     /* ---------------- frame-wide buffers ---------------- */
 
     /**
-     * Make the sprite instance buffer hold `instances` instances.
-     *
-     * Growing is safe **only while no draw of this frame references the buffer**; mid-frame it has to
-     * rotate instead (see `flushSprites`), so the already-encoded draws keep their own buffer.
+     * Grow the sprite instance buffer before the frame starts. Mid-frame, when earlier draws
+     * already reference the buffer, `flushSprites` rotates to a new one instead.
      */
     private reserveInstanceCapacity(needed: number): void {
         if (needed <= this.instanceCapacity) return;
@@ -390,7 +575,6 @@ export class WebGPUDevice implements RenderDevice {
         this.instanceCapacity = cap;
     }
 
-    /** Grow the vertex buffer while it is still unreferenced this frame */
     private reserveVectorCapacity(needed: number): void {
         if (needed <= this.vectorCapacity) return;
         let cap = this.vectorCapacity;
@@ -403,14 +587,12 @@ export class WebGPUDevice implements RenderDevice {
         this.vectorCapacity = cap;
     }
 
-    /**
-     * Start a fresh instance buffer for the data that is still un-uploaded (the draws encoded so far
-     * keep reading the old buffer, which stays alive until the GPU is done with it).
-     */
+    /** Start a fresh instance buffer for the not-yet-uploaded data; earlier draws keep the old one. */
     private rotateInstanceBuffer(): void {
         const needed = this.instances.count - this.instanceUploaded;
         let cap = Math.max(1024, this.instanceCapacity);
         while (cap < needed) cap *= 2;
+        this.retiredBuffers.push(this.instanceBuffer);
         this.instanceBuffer = this.device.createBuffer({
             size: cap * FLOATS_PER_INSTANCE * 4,
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -423,6 +605,7 @@ export class WebGPUDevice implements RenderDevice {
         const needed = this.vectorVertices - this.vectorUploaded;
         let cap = Math.max(4096, this.vectorCapacity);
         while (cap < needed) cap *= 2;
+        this.retiredBuffers.push(this.vectorBuffer);
         this.vectorBuffer = this.device.createBuffer({
             size: cap * FLOATS_PER_VERTEX * 4,
             usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -439,7 +622,6 @@ export class WebGPUDevice implements RenderDevice {
             if (this.spriteEncoded) this.rotateInstanceBuffer();
             else this.reserveInstanceCapacity(this.instances.count);
         }
-        // only the range [first, count) is new — every earlier flush already wrote its own range
         const view = this.instances.view();
         const byteOffset = (first - this.instanceBase) * stride;
         const byteLength = (this.instances.count - first) * stride;
@@ -457,12 +639,12 @@ export class WebGPUDevice implements RenderDevice {
                     layout: this.bindGroupLayout,
                     entries: [
                         { binding: 0, resource: { buffer: this.projBuffer } },
-                        { binding: 1, resource: tex.sampler ?? this.sampler },
+                        { binding: 1, resource: tex.sampler },
                         { binding: 2, resource: tex.texture.createView() },
                     ],
                 });
             }
-            this.pass!.setPipeline(this.spritePipeline);
+            this.pass!.setPipeline(tex.premultiplied ? this.spritePipelines.premultiplied : this.spritePipelines.straight);
             this.pass!.setBindGroup(0, tex.bindGroup);
             this.pass!.setVertexBuffer(
                 0,
@@ -476,7 +658,6 @@ export class WebGPUDevice implements RenderDevice {
         this.totals.instances += this.instances.count - first;
         this.instanceUploaded = this.instances.count;
         this.spriteEncoded = true;
-        // keep the instances: the buffer accumulates for the whole frame, only the batches are consumed
         this.batches.reset();
     }
 
@@ -500,7 +681,6 @@ export class WebGPUDevice implements RenderDevice {
         this.pass!.setPipeline(this.vectorPipeline);
         this.pass!.setBindGroup(0, this.vectorBindGroup);
         this.pass!.setVertexBuffer(0, this.vectorBuffer);
-        // draw only this flush's range; `firstVertex` is relative to the bound buffer's origin
         const count = this.vectorVertices - first;
         this.pass!.draw(count, 1, first - this.vectorBase);
         this.totals.drawCalls++;
@@ -509,29 +689,85 @@ export class WebGPUDevice implements RenderDevice {
         this.vectorEncoded = true;
     }
 
+    /* ---------------- textures ---------------- */
+
+    private createGpuTexture(width: number, height: number): GPUTexture {
+        return this.device.createTexture({
+            size: [width, height],
+            format: "rgba8unorm",
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+    }
+
+    /** `flipY` matches the GL backend's UNPACK_FLIP_Y, so atlas UVs are identical on both. */
+    private uploadTexture(texture: GpuTexture): void {
+        this.device.queue.copyExternalImageToTexture(
+            { source: texture.source.image as CanvasImageSource, flipY: true },
+            { texture: texture.texture, premultipliedAlpha: texture.premultiplied },
+            [texture.source.width, texture.source.height],
+        );
+    }
+
     public createTexture(
         image: TexImageSource,
         width: number,
         height: number,
         options: TextureOptions = {},
     ): RenderTexture {
-        const texture = this.device.createTexture({
-            size: [width, height],
-            format: "rgba8unorm",
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        if (this.disposed) throw new Error("[renderer] device has been disposed");
+        if (this.lost) throw new Error("[renderer] device is lost");
+        assertTextureSize(image, width, height);
+        const texture = new GpuTexture(this.createGpuTexture(width, height), this.samplerFor(options), {
+            image,
+            width,
+            height,
+            options,
         });
-        // `flipY` matches the GL backend's `UNPACK_FLIP_Y_WEBGL`, so UV math is identical.
-        // `premultipliedAlpha` mirrors `UNPACK_PREMULTIPLY_ALPHA_WEBGL` (GL's default is false, same here).
-        const premultipliedAlpha = options.premultiplyAlpha === true;
-        this.device.queue.copyExternalImageToTexture(
-            { source: image as CanvasImageSource, flipY: true },
-            { texture, premultipliedAlpha },
-            [width, height],
-        );
-        return new GpuTexture(texture, width, height, this.samplerFor(options));
+        this.textures.add(texture);
+        this.uploadTexture(texture);
+        return texture;
     }
 
-    /** Sampler for a texture-option set; `linear !== false` matches WebGL's `Texture.fromImage` defaults */
+    public updateTexture(
+        texture: RenderTexture,
+        image: TexImageSource,
+        width: number,
+        height: number,
+        options?: TextureOptions,
+    ): void {
+        const owned = this.ownedTexture(texture);
+        if (this.lost) throw new Error("[renderer] device is lost");
+        assertTextureSize(image, width, height);
+        const opts = options ?? owned.source.options;
+        owned.texture.destroy();
+        owned.texture = this.createGpuTexture(width, height);
+        owned.source = { image, width, height, options: opts };
+        owned.width = width;
+        owned.height = height;
+        owned.premultiplied = opts.premultiplyAlpha === true;
+        owned.sampler = this.samplerFor(opts);
+        owned.bindGroup = null;
+        this.uploadTexture(owned);
+    }
+
+    public disposeTexture(texture: RenderTexture): void {
+        const owned = this.ownedTexture(texture);
+        this.textures.delete(owned);
+        owned.bindGroup = null;
+        owned.texture.destroy();
+    }
+
+    private ownedTexture(texture: RenderTexture): GpuTexture {
+        if (texture.kind !== this.kind) {
+            throw new Error(`[renderer] texture belongs to the ${texture.kind} backend, not webgpu`);
+        }
+        if (!(texture instanceof GpuTexture) || !this.textures.has(texture)) {
+            throw new Error("[renderer] texture was not created by this device");
+        }
+        return texture;
+    }
+
+    /** Sampler for a texture-option set; defaults match WebGL's linear + clamp-to-edge. */
     private samplerFor(options: TextureOptions): GPUSampler {
         const linear = options.linear !== false;
         const wrap = options.wrap === true;
@@ -550,7 +786,13 @@ export class WebGPUDevice implements RenderDevice {
         return sampler;
     }
 
+    /* ---------------- drawing ---------------- */
+
     public drawSprite(texture: RenderTexture, call: SpriteDrawCall): void {
+        if (this.lost) return;
+        if (texture.kind !== this.kind) {
+            throw new Error(`[renderer] texture belongs to the ${texture.kind} backend, not webgpu`);
+        }
         if (this.layer === "vector") this.flushVectors();
         this.layer = "sprite";
         const start = this.instances.count;
@@ -559,6 +801,7 @@ export class WebGPUDevice implements RenderDevice {
     }
 
     public addTriangles(points: readonly number[], color: Color | undefined, dx: number, dy: number): void {
+        if (this.lost) return;
         if (this.layer === "sprite") this.flushSprites();
         this.layer = "vector";
         const n = (points.length / 2) | 0;
@@ -581,6 +824,7 @@ export class WebGPUDevice implements RenderDevice {
     }
 
     public addSegments(segments: readonly Segment[], width: number, color: Color | undefined): void {
+        if (this.lost) return;
         if (segments.length === 0 || width <= 0) return;
         if (this.layer === "sprite") this.flushSprites();
         this.layer = "vector";
@@ -599,9 +843,15 @@ export class WebGPUDevice implements RenderDevice {
             if (len < 1e-9) continue;
             const nx = (-dy / len) * half;
             const ny = (dx / len) * half;
-            const x0n = s.x0 + nx, y0n = s.y0 + ny, x1n = s.x1 + nx, y1n = s.y1 + ny;
-            const x0p = s.x0 - nx, y0p = s.y0 - ny, x1p = s.x1 - nx, y1p = s.y1 - ny;
-            // two triangles: (x0n,y0n) (x1n,y1n) (x0p,y0p) — (x0p,y0p) (x1n,y1n) (x1p,y1p)
+            const x0n = s.x0 + nx;
+            const y0n = s.y0 + ny;
+            const x1n = s.x1 + nx;
+            const y1n = s.y1 + ny;
+            const x0p = s.x0 - nx;
+            const y0p = s.y0 - ny;
+            const x1p = s.x1 - nx;
+            const y1p = s.y1 - ny;
+            // two triangles per segment
             const verts = [x0n, y0n, x1n, y1n, x0p, y0p, x0p, y0p, x1n, y1n, x1p, y1p];
             for (let i = 0; i < 6; i++) {
                 d[o++] = verts[i * 2] as number;
@@ -628,8 +878,13 @@ export class WebGPUDevice implements RenderDevice {
     public dispose(): void {
         if (this.disposed) return;
         this.disposed = true;
+        for (const texture of this.textures) texture.texture.destroy();
+        this.textures.clear();
+        this.releaseMsaa();
         this.instanceBuffer.destroy();
         this.vectorBuffer.destroy();
+        for (const buffer of this.retiredBuffers) buffer.destroy();
+        this.retiredBuffers = [];
         this.projBuffer.destroy();
         this.device.destroy();
     }

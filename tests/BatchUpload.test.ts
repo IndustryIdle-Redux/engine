@@ -1,22 +1,20 @@
 /**
- * GL buffer upload bookkeeping.
+ * WebGL2 device tests with a recording fake context.
  *
- * The WebGL2 backend keeps one GPU buffer per batch kind. Historically every `flush()` uploaded its
- * chunk with `gl.bufferData(...)`, which **reallocates the buffer's data store** (orphaning). A frame
- * that alternates vector/sprite work — the overlay used to do that once per visible tile — therefore
- * performed one GPU allocation per layer switch, regardless of how small the chunk was.
- *
- * The invariants locked down here:
- *  1. a frame's uploads are **disjoint** and cover exactly the written range once (each byte uploaded once)
- *  2. the number of `bufferData` store allocations does **not** grow with the flush count
- *  3. `begin()` (once per frame) restarts the watermark, `flush()` (many times per frame) does not
+ * Covered:
+ *  - frame upload bookkeeping (disjoint ranges, no per-flush store allocation)
+ *  - the per-batch attribute pointer offset `batch.start * stride`
+ *  - texture create/update/dispose and size validation
+ *  - context lost/restored: no-op rendering, one `onLost` call and re-upload on restore
+ *  - premultiplied blend selection per batch
  */
 
 import { describe, expect, it } from "vitest";
 import { Mat3 } from "../src/Mat3";
 import { Color } from "../src/Color";
-import { FLOATS_PER_INSTANCE } from "../src/InstanceBuffer";
+import { FLOATS_PER_INSTANCE, INSTANCE_ATTRIBS } from "../src/InstanceBuffer";
 import { WebGL2Device } from "../src/renderer/WebGL2Device";
+import { Texture } from "../src/renderer/Texture";
 import type { RenderTexture } from "../src/renderer/RenderDevice";
 
 /* ------------------------------------------------------------------ *
@@ -24,15 +22,19 @@ import type { RenderTexture } from "../src/renderer/RenderDevice";
  * ------------------------------------------------------------------ */
 
 interface Upload {
-    /** id of the GPU buffer the write targeted (the sprite and vector batches own separate buffers) */
+    /** id of the GPU buffer the write targeted (sprite and vector batches own separate buffers) */
     buffer: number;
     /** byte offset the data was written at (`bufferData` always writes a fresh store, offset 0) */
     offset: number;
-    /** bytes written (`bufferData` with a size hint instead of data is recorded with `sizeHint`) */
+    /** bytes written */
     size: number;
     /** true when only a capacity hint was passed (no payload) */
     sizeHint: boolean;
     seq: number;
+}
+
+interface FakeTexture {
+    id: number;
 }
 
 class FakeGL {
@@ -41,10 +43,21 @@ class FakeGL {
     public readonly instanceDraws: number[] = [];
     /** vertex counts of `drawArrays` calls, in order */
     public readonly vertexDraws: number[] = [];
+    /** attribute pointer byte offsets, in call order */
+    public readonly pointerOffsets: number[] = [];
+    /** blend factor pairs, in call order */
+    public readonly blendCalls: Array<[number, number]> = [];
+    /** textures created by the fake, in order */
+    public readonly texturesCreated: FakeTexture[] = [];
+    public readonly texturesDeleted: FakeTexture[] = [];
+    public texImageCalls = 0;
     public bufferDataCalls = 0;
     public bufferSubDataCalls = 0;
+    /** the fake canvas doubles as the context-loss event target */
+    public readonly canvas = new EventTarget();
     private seq = 0;
     private nextBufferId = 1;
+    private nextTextureId = 1;
     private boundBuffer = 0;
 
     public readonly TEXTURE0 = 0x84c0;
@@ -60,8 +73,21 @@ class FakeGL {
     public readonly DEPTH_TEST = 0x0b71;
     public readonly BLEND = 0x0be2;
     public readonly SRC_ALPHA = 0x0302;
+    public readonly ONE = 0x0001;
     public readonly ONE_MINUS_SRC_ALPHA = 0x0303;
     public readonly COLOR_BUFFER_BIT = 0x4000;
+    public readonly RGBA = 0x1908;
+    public readonly UNSIGNED_BYTE = 0x1401;
+    public readonly NEAREST = 0x2600;
+    public readonly LINEAR = 0x2601;
+    public readonly REPEAT = 0x2901;
+    public readonly CLAMP_TO_EDGE = 0x812f;
+    public readonly TEXTURE_MIN_FILTER = 0x2801;
+    public readonly TEXTURE_MAG_FILTER = 0x2800;
+    public readonly TEXTURE_WRAP_S = 0x2802;
+    public readonly TEXTURE_WRAP_T = 0x2803;
+    public readonly UNPACK_FLIP_Y_WEBGL = 0x9240;
+    public readonly UNPACK_PREMULTIPLY_ALPHA_WEBGL = 0x9241;
 
     public createShader(): object {
         return {};
@@ -100,19 +126,36 @@ class FakeGL {
         this.boundBuffer = buffer ? buffer.id : 0;
     }
     public enableVertexAttribArray(): void {}
-    public vertexAttribPointer(): void {}
+    public vertexAttribPointer(_location: number, _size: number, _type: number, _norm: boolean, _stride: number, offset = 0): void {
+        this.pointerOffsets.push(offset);
+    }
     public vertexAttribDivisor(): void {}
     public useProgram(): void {}
     public uniformMatrix3fv(): void {}
     public uniform1i(): void {}
     public activeTexture(): void {}
     public bindTexture(): void {}
+    public createTexture(): FakeTexture {
+        const texture = { id: this.nextTextureId++ };
+        this.texturesCreated.push(texture);
+        return texture;
+    }
+    public deleteTexture(texture: FakeTexture): void {
+        this.texturesDeleted.push(texture);
+    }
+    public texImage2D(): void {
+        this.texImageCalls++;
+    }
+    public texParameteri(): void {}
+    public pixelStorei(): void {}
     public deleteBuffer(): void {}
     public deleteVertexArray(): void {}
     public deleteProgram(): void {}
     public disable(): void {}
     public enable(): void {}
-    public blendFunc(): void {}
+    public blendFunc(src: number, dst: number): void {
+        this.blendCalls.push([src, dst]);
+    }
     public viewport(): void {}
     public clearColor(): void {}
     public clear(): void {}
@@ -138,9 +181,8 @@ class FakeGL {
         this.instanceDraws.push(instances);
     }
 
-    public drawArrays(_mode: number, first: number, count: number): void {
-        this.vertexDraws.push(count);
-        void first;
+    public drawArrays(_mode: number, _first: number, _count: number): void {
+        this.vertexDraws.push(_count);
     }
 
     /** payload uploads only (a `bufferData` size hint carries no bytes) */
@@ -149,7 +191,9 @@ class FakeGL {
     }
 }
 
-const ATLAS = { width: 1024, height: 1024 } as unknown as RenderTexture;
+const IMAGE_2X2 = { width: 2, height: 2 } as unknown as TexImageSource;
+const ATLAS = { kind: "webgl2", width: 1024, height: 1024, premultiplied: false } as RenderTexture;
+const FONT = { kind: "webgl2", width: 512, height: 512, premultiplied: false } as RenderTexture;
 
 function makeDevice(): { gl: FakeGL; device: WebGL2Device } {
     const gl = new FakeGL();
@@ -178,9 +222,10 @@ function assertDisjoint(uploads: Upload[]): void {
             const b = uploads[j] as Upload;
             if (a.buffer !== b.buffer) continue;
             const overlap = a.offset < b.offset + b.size && b.offset < a.offset + a.size;
-            expect(overlap, `uploads overlap: [${a.offset},${a.offset + a.size}) and [${b.offset},${b.offset + b.size})`).toBe(
-                false,
-            );
+            expect(
+                overlap,
+                `uploads overlap: [${a.offset},${a.offset + a.size}) and [${b.offset},${b.offset + b.size})`,
+            ).toBe(false);
         }
     }
 }
@@ -190,7 +235,6 @@ describe("WebGL2 batch uploads", () => {
         const { gl, device } = makeDevice();
         runAlternatingFrame(device, 40, 4);
 
-        // sprite chunks: 40 * (4 instances * 64 B) = 10240 B; vector chunks: 40 * (3 vertices * 24 B) = 2880 B
         const expected = 40 * 4 * FLOATS_PER_INSTANCE * 4 + 40 * 3 * 6 * 4;
         const payloads = gl.payloads;
         expect(payloads.reduce((a, u) => a + u.size, 0)).toBe(expected);
@@ -203,11 +247,8 @@ describe("WebGL2 batch uploads", () => {
         const many = makeDevice();
         runAlternatingFrame(many.device, 500, 4);
 
-        // 10x the flushes: the two stores grow logarithmically (doubling), never once per flush.
-        // Before this change the same frame issued one `bufferData` per flush (measured: 1000 for 500 flushes).
         expect(many.gl.bufferDataCalls).toBeLessThanOrEqual(few.gl.bufferDataCalls + 4);
         expect(many.gl.bufferDataCalls).toBeLessThanOrEqual(16);
-        // every flush after the stores are big enough is a plain sub-data write
         expect(many.gl.bufferSubDataCalls).toBeGreaterThanOrEqual(500);
     });
 
@@ -220,7 +261,6 @@ describe("WebGL2 batch uploads", () => {
         runAlternatingFrame(device, 3, 2);
         const secondFrame = gl.payloads.slice(firstFrame);
         expect(secondFrame.length).toBe(firstFrame);
-        // the first chunk of the second frame starts at offset 0
         expect(Math.min(...secondFrame.map((u) => u.offset))).toBe(0);
     });
 
@@ -228,19 +268,155 @@ describe("WebGL2 batch uploads", () => {
         const { gl, device } = makeDevice();
         runAlternatingFrame(device, 7, 3);
         expect(device.instanceCount).toBe(7 * 3);
-        // 7 sprite chunks (one per flush) + 7 vector chunks
         expect(device.drawCalls).toBe(14);
         expect(device.triangleCount).toBe(7 * 1);
         expect(gl.instanceDraws.reduce((a, b) => a + b, 0)).toBe(7 * 3);
     });
 
-    it("regression: the pre-change behaviour allocated a GPU store per flush (measurement record)", () => {
-        // The old code called `bufferData(view())` inside every flush, i.e. one store allocation per
-        // layer switch: measured 1000 allocations / 164 KB of payload for a 500-flush, 2000-instance frame.
-        // Keep the numbers documented so the invariant above is not "optimised" back.
+    it("second batch's attribute pointers start at batch.start * stride", () => {
         const { gl, device } = makeDevice();
-        runAlternatingFrame(device, 500, 4);
-        expect(gl.bufferDataCalls).toBeLessThanOrEqual(16);
-        expect(gl.bufferSubDataCalls).toBeGreaterThanOrEqual(1000);
+        gl.pointerOffsets.length = 0;
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        for (let i = 0; i < 2; i++) device.drawSprite(ATLAS, { x: i, y: i, w: 8, h: 8, color: Color.WHITE });
+        device.drawSprite(FONT, { x: 0, y: 0, w: 8, h: 8, color: Color.WHITE });
+        device.endFrame();
+
+        expect(gl.instanceDraws).toEqual([2, 1]);
+        // seven pointers per batch: batch 2 must be offset by two instances
+        expect(gl.pointerOffsets.length).toBe(2 * INSTANCE_ATTRIBS.length);
+        const base = 2 * FLOATS_PER_INSTANCE * 4;
+        for (let i = 0; i < INSTANCE_ATTRIBS.length; i++) {
+            const attr = INSTANCE_ATTRIBS[i] as { offset: number };
+            expect(gl.pointerOffsets[INSTANCE_ATTRIBS.length + i]).toBe(base + attr.offset * 4);
+        }
+    });
+});
+
+describe("WebGL2 textures", () => {
+    it("creates a texture with the backend kind and re-uploads on update", () => {
+        const { gl, device } = makeDevice();
+        const texture = device.createTexture(IMAGE_2X2, 2, 2, { linear: false }) as Texture;
+        expect(texture.kind).toBe("webgl2");
+        expect(texture.premultiplied).toBe(false);
+        expect(texture.width).toBe(2);
+
+        const handle = texture.handle;
+        gl.texImageCalls = 0;
+        device.updateTexture(texture, { width: 4, height: 4 } as TexImageSource, 4, 4);
+        expect(gl.texImageCalls).toBe(1);
+        expect(texture.handle).toBe(handle);
+        expect(texture.width).toBe(4);
+        expect(texture.height).toBe(4);
+    });
+
+    it("rejects a declared size that does not match the source image", () => {
+        const { device } = makeDevice();
+        expect(() => device.createTexture(IMAGE_2X2, 3, 3)).toThrow(/does not match/);
+    });
+
+    it("rejects a texture from the other backend", () => {
+        const { device } = makeDevice();
+        const foreign = { kind: "webgpu", width: 1, height: 1, premultiplied: false } as RenderTexture;
+        expect(() => device.drawSprite(foreign, { x: 0, y: 0, w: 1, h: 1 })).toThrow(/webgpu backend/);
+        expect(() => device.updateTexture(foreign, IMAGE_2X2, 2, 2)).toThrow(/webgpu backend/);
+    });
+
+    it("disposeTexture deletes the GL object and rejects further use", () => {
+        const { gl, device } = makeDevice();
+        const texture = device.createTexture(IMAGE_2X2, 2, 2);
+        device.disposeTexture(texture);
+        expect(gl.texturesDeleted.length).toBe(1);
+        expect(() => device.updateTexture(texture, IMAGE_2X2, 2, 2)).toThrow(/not created by this device/);
+    });
+
+    it("device dispose deletes every tracked texture", () => {
+        const { gl, device } = makeDevice();
+        device.createTexture(IMAGE_2X2, 2, 2);
+        device.createTexture(IMAGE_2X2, 2, 2);
+        device.dispose();
+        expect(gl.texturesDeleted.length).toBe(2);
+        device.dispose();
+        expect(gl.texturesDeleted.length).toBe(2);
+    });
+});
+
+describe("WebGL2 premultiplied blending", () => {
+    it("switches blendFunc per batch and restores straight alpha at frame start", () => {
+        const { gl, device } = makeDevice();
+        const premultiplied = device.createTexture(IMAGE_2X2, 2, 2, { premultiplyAlpha: true });
+
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.drawSprite(premultiplied, { x: 0, y: 0, w: 8, h: 8 });
+        device.drawSprite(ATLAS, { x: 0, y: 0, w: 8, h: 8 });
+        device.endFrame();
+
+        expect(gl.blendCalls).toContainEqual([gl.ONE, gl.ONE_MINUS_SRC_ALPHA]);
+        expect(gl.blendCalls[gl.blendCalls.length - 1]).toEqual([gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA]);
+
+        // the next frame starts straight even though the previous one ended on a sprite batch
+        const before = gl.blendCalls.length;
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        expect(gl.blendCalls.slice(before)).toContainEqual([gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA]);
+        device.endFrame();
+    });
+});
+
+describe("WebGL2 context loss", () => {
+    it("stops rendering while lost and reports loss once", () => {
+        const { gl, device } = makeDevice();
+        let lostCalls = 0;
+        device.onLost = () => lostCalls++;
+
+        const event = new Event("webglcontextlost", { cancelable: true });
+        gl.canvas.dispatchEvent(event);
+        expect(event.defaultPrevented).toBe(true);
+        expect(device.isLost).toBe(true);
+        expect(lostCalls).toBe(1);
+
+        // repeated loss notifications do not call onLost again
+        gl.canvas.dispatchEvent(new Event("webglcontextlost", { cancelable: true }));
+        expect(lostCalls).toBe(1);
+
+        const drawsBefore = gl.instanceDraws.length;
+        runAlternatingFrame(device, 2, 2);
+        expect(gl.instanceDraws.length).toBe(drawsBefore);
+        expect(() => device.createTexture(IMAGE_2X2, 2, 2)).toThrow(/lost/);
+    });
+
+    it("rebuilds batches and re-uploads retained textures on restore", async () => {
+        const { gl, device } = makeDevice();
+        const texture = device.createTexture(IMAGE_2X2, 2, 2) as Texture;
+        const oldHandle = texture.handle;
+        let lostCalls = 0;
+        device.onLost = () => lostCalls++;
+
+        gl.canvas.dispatchEvent(new Event("webglcontextlost", { cancelable: true }));
+        expect(await device.recover()).toBe(false);
+
+        gl.texImageCalls = 0;
+        gl.canvas.dispatchEvent(new Event("webglcontextrestored"));
+        expect(device.isLost).toBe(false);
+        expect(lostCalls).toBe(1);
+        // a fresh GL object with a fresh upload
+        expect(texture.handle).not.toBe(oldHandle);
+        expect(gl.texImageCalls).toBe(1);
+
+        const drawsBefore = gl.instanceDraws.length;
+        runAlternatingFrame(device, 2, 3);
+        expect(gl.instanceDraws.length).toBeGreaterThan(drawsBefore);
+        expect(await device.recover()).toBe(true);
+    });
+
+    it("removes the listeners and deletes textures on dispose", () => {
+        const { gl, device } = makeDevice();
+        let lostCalls = 0;
+        device.onLost = () => lostCalls++;
+        device.createTexture(IMAGE_2X2, 2, 2);
+        device.dispose();
+        expect(gl.texturesDeleted.length).toBe(1);
+
+        gl.canvas.dispatchEvent(new Event("webglcontextlost", { cancelable: true }));
+        expect(lostCalls).toBe(0);
+        expect(device.isLost).toBe(false);
     });
 });

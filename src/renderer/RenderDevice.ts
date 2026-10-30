@@ -1,36 +1,40 @@
 /**
- * Render device abstraction — the seam between the backend-agnostic renderer facade
- * (`Renderer2D`) and the two graphics backends:
+ * Backend seam between `Renderer2D` and the two graphics backends (`WebGL2Device`,
+ * `WebGPUDevice`).
  *
- * | backend | role |
- * |---|---|
- * | `WebGL2Device` | **compatibility** — conservative, battle-tested; kept working on every browser |
- * | `WebGPUDevice`  | **primary** — aggressive optimisation target (compact instances, compute passes, cached buffers) |
- *
- * ### Draw-order guarantee (why `beginFrame`/`endFrame` wrap layers)
- * Both backends batch by kind (textured sprites / solid triangles). To keep the **call order**
- * visible — logistics lines over buildings, selection rings over dots, … — a device must flush
- * the currently active batch when the call kind switches (and at `endFrame`). Batching everything
- * of one kind before the other would silently reorder the scene (that bug existed before this split).
+ * Both devices flush their active batch when the draw kind switches, so the submitted
+ * call order is preserved (vector overlay over sprites, etc.).
  */
 
 import type { Color } from "../Color";
 import type { Mat3 } from "../Mat3";
 import type { SpriteDrawCall } from "../InstanceBuffer";
 
-/** Backend-agnostic texture handle (the facade never touches GL/GPU objects) */
+/** Backend-agnostic texture handle. The facade never touches GL/GPU objects. */
 export interface RenderTexture {
+    /** Which backend created this texture. */
+    readonly kind: "webgl2" | "webgpu";
     readonly width: number;
     readonly height: number;
+    /** Whether the image was uploaded with premultiplied alpha. */
+    readonly premultiplied: boolean;
 }
 
 export interface TextureOptions {
-    /** linear filtering (pixel-art textures can set false) */
+    /** Linear filtering; set false for pixel-art textures. */
     linear?: boolean;
-    /** wrap/repeat */
+    /** Repeat/tile instead of clamp-to-edge. */
     wrap?: boolean;
-    /** premultiply alpha */
+    /** Premultiply alpha on upload. */
     premultiplyAlpha?: boolean;
+}
+
+/** Original source of a texture, retained so it can be re-uploaded after loss. */
+export interface TextureSource {
+    image: TexImageSource;
+    width: number;
+    height: number;
+    options: TextureOptions;
 }
 
 export interface Segment {
@@ -40,8 +44,60 @@ export interface Segment {
     y1: number;
 }
 
+/** Pixel size of a decoded image source, or null when the type has no readable size. */
+export function textureSourceSize(image: TexImageSource): { width: number; height: number } | null {
+    const source = image as unknown as {
+        width?: unknown;
+        height?: unknown;
+        naturalWidth?: unknown;
+        naturalHeight?: unknown;
+        videoWidth?: unknown;
+        videoHeight?: unknown;
+    };
+    if (
+        typeof source.naturalWidth === "number" &&
+        source.naturalWidth > 0 &&
+        typeof source.naturalHeight === "number" &&
+        source.naturalHeight > 0
+    ) {
+        return { width: source.naturalWidth, height: source.naturalHeight };
+    }
+    if (
+        typeof source.videoWidth === "number" &&
+        source.videoWidth > 0 &&
+        typeof source.videoHeight === "number" &&
+        source.videoHeight > 0
+    ) {
+        return { width: source.videoWidth, height: source.videoHeight };
+    }
+    if (
+        typeof source.width === "number" &&
+        source.width > 0 &&
+        typeof source.height === "number" &&
+        source.height > 0
+    ) {
+        return { width: source.width, height: source.height };
+    }
+    return null;
+}
+
+/** Both backends require the declared size to match the decoded source size. */
+export function assertTextureSize(image: TexImageSource, width: number, height: number): void {
+    const size = textureSourceSize(image);
+    if (size && (size.width !== width || size.height !== height)) {
+        throw new Error(
+            `[renderer] texture size ${width}x${height} does not match the source image (${size.width}x${size.height})`,
+        );
+    }
+}
+
 export interface RenderDevice {
     readonly kind: "webgl2" | "webgpu";
+
+    /** True after the GPU device or the WebGL2 context has been lost. */
+    readonly isLost: boolean;
+    /** Called once when the device is lost; rendering is a no-op until `recover()` succeeds. */
+    onLost: (() => void) | null;
 
     /** stats for the last finished frame */
     readonly drawCalls: number;
@@ -57,12 +113,26 @@ export interface RenderDevice {
 
     createTexture(image: TexImageSource, width: number, height: number, options?: TextureOptions): RenderTexture;
 
+    /** Re-upload a texture, optionally with a different image or size. */
+    updateTexture(
+        texture: RenderTexture,
+        image: TexImageSource,
+        width: number,
+        height: number,
+        options?: TextureOptions,
+    ): void;
+
+    disposeTexture(texture: RenderTexture): void;
+
     /* ---- textured sprite layer (buildings / deposits / dots / glyphs) ---- */
     drawSprite(texture: RenderTexture, call: SpriteDrawCall): void;
 
     /* ---- solid triangle layer (grid / lines / highlight / circles) ---- */
     addTriangles(points: readonly number[], color: Color | undefined, dx: number, dy: number): void;
     addSegments(segments: readonly Segment[], width: number, color: Color | undefined): void;
+
+    /** Rebuild GPU resources after loss. WebGL2 cannot force this (the browser restores). */
+    recover(): Promise<boolean>;
 
     dispose(): void;
 }

@@ -1,44 +1,70 @@
 /**
- * GPU texture wrapper.
- *
- * Corresponds to and replaces Cocos's `cc.Texture2D` / `cc.SpriteFrame` / `cc.SpriteAtlas`.
- *
- * Key design: **the atlas is the norm, not a special case**.
- * The original used Cocos's AutoAtlas (214 building images packed into one 701×1024 PNG);
- * here we use a "one texture + one UV sub-rectangle per sprite" model directly,
- * which fits instanced batch rendering naturally (sprites sharing a texture finish in one draw call).
+ * WebGL2 texture wrapper. The atlas model is "one texture + one UV sub-rect per sprite",
+ * so sprites that share a texture merge into a single instanced draw.
  */
 
-export interface TextureOptions {
-    /** Whether to use linear filtering (default true; pixel-art textures can set false) */
-    linear?: boolean;
-    /** Whether to repeat/tile (needed when the map grid lines are baked into a texture) */
-    wrap?: boolean;
-    /** Premultiply alpha (default false) */
-    premultiplyAlpha?: boolean;
+import { assertTextureSize, type TextureOptions, type TextureSource } from "./RenderDevice";
+
+export type { TextureOptions } from "./RenderDevice";
+
+/** Creates the GL object and applies the sampler parameters for the given options. */
+function createHandle(gl: WebGL2RenderingContext, options: TextureOptions): WebGLTexture {
+    const handle = gl.createTexture();
+    if (!handle) throw new Error("[renderer] createTexture failed");
+    const filter = options.linear === false ? gl.NEAREST : gl.LINEAR;
+    const wrap = options.wrap ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+    gl.bindTexture(gl.TEXTURE_2D, handle);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    return handle;
+}
+
+/** Uploads an image or a 1×1 pixel block. Flipped on Y so UV (0,0) is the image top-left. */
+function upload(
+    gl: WebGL2RenderingContext,
+    handle: WebGLTexture,
+    image: TexImageSource | null,
+    pixels: Uint8Array | null,
+    premultiplied: boolean,
+): void {
+    gl.bindTexture(gl.TEXTURE_2D, handle);
+    try {
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, image !== null);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premultiplied);
+        if (image) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        } else {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        }
+    } finally {
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+    }
 }
 
 export class Texture {
-    public readonly handle: WebGLTexture;
-    public readonly width: number;
-    public readonly height: number;
-    /** Tracks whether this has already been released, to avoid a double delete */
+    public readonly kind = "webgl2" as const;
+    public handle: WebGLTexture;
+    public width: number;
+    public height: number;
+    public premultiplied = false;
+
+    private source: TextureSource | null;
+    private pixels: Uint8Array | null;
     private disposed = false;
 
-    private constructor(handle: WebGLTexture, width: number, height: number) {
+    private constructor(handle: WebGLTexture, source: TextureSource | null, pixels: Uint8Array | null) {
         this.handle = handle;
-        this.width = width;
-        this.height = height;
+        this.source = source;
+        this.pixels = pixels;
+        this.width = source ? source.width : 1;
+        this.height = source ? source.height : 1;
     }
 
-    /**
-     * Create a texture from an already-decoded image.
-     *
-     * Upload directly with `WebGL2RenderingContext`'s `texImage2D`
-     * and **flip the Y axis** (`UNPACK_FLIP_Y_WEBGL`),
-     * so the UV origin matches the top-left of the screen -- the same convention as Cocos's `SpriteFrame`,
-     * which means UV math ported over from Cocos needs no changes.
-     */
     public static fromImage(
         gl: WebGL2RenderingContext,
         image: TexImageSource,
@@ -46,58 +72,58 @@ export class Texture {
         height: number,
         options: TextureOptions = {},
     ): Texture {
-        const handle = gl.createTexture();
-        if (!handle) throw new Error("[renderer] createTexture failed");
+        assertTextureSize(image, width, height);
+        const handle = createHandle(gl, options);
+        const texture = new Texture(handle, { image, width, height, options }, null);
+        texture.premultiplied = options.premultiplyAlpha === true;
+        upload(gl, handle, image, null, texture.premultiplied);
+        return texture;
+    }
 
-        gl.bindTexture(gl.TEXTURE_2D, handle);
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, options.premultiplyAlpha === true);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    /** 1×1 solid-colour texture, used by sprites that have no image (bars, blocks). */
+    public static solid(gl: WebGL2RenderingContext, r = 255, g = 255, b = 255, a = 255): Texture {
+        const handle = createHandle(gl, {});
+        const pixels = new Uint8Array([r, g, b, a]);
+        const texture = new Texture(handle, null, pixels);
+        upload(gl, handle, null, pixels, false);
+        return texture;
+    }
 
+    /** Re-upload in place; keeps callers' references valid. */
+    public update(
+        gl: WebGL2RenderingContext,
+        image: TexImageSource,
+        width: number,
+        height: number,
+        options: TextureOptions = this.source?.options ?? {},
+    ): void {
+        if (this.disposed) throw new Error("[renderer] texture has been disposed");
+        assertTextureSize(image, width, height);
+        this.source = { image, width, height, options };
+        this.pixels = null;
+        this.width = width;
+        this.height = height;
+        this.premultiplied = options.premultiplyAlpha === true;
+        // Filter settings are per-object, so they must be re-applied when options change.
         const filter = options.linear === false ? gl.NEAREST : gl.LINEAR;
         const wrap = options.wrap ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+        gl.bindTexture(gl.TEXTURE_2D, this.handle);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
-        // Mipmaps off: 2D sprites normally don't need them, and it saves a generateMipmap call
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
         gl.bindTexture(gl.TEXTURE_2D, null);
-        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-
-        return new Texture(handle, width, height);
+        upload(gl, this.handle, this.source.image, null, this.premultiplied);
     }
 
-    /**
-     * Create a solid-color 1×1 texture.
-     *
-     * For sprites with no image (color blocks, health bars, grid lines) -- this way they can also go through batch rendering,
-     * without needing a separate shader.
-     */
-    public static solid(gl: WebGL2RenderingContext, r = 255, g = 255, b = 255, a = 255): Texture {
-        const handle = gl.createTexture();
-        if (!handle) throw new Error("[renderer] createTexture failed");
-        gl.bindTexture(gl.TEXTURE_2D, handle);
-        gl.texImage2D(
-            gl.TEXTURE_2D,
-            0,
-            gl.RGBA,
-            1,
-            1,
-            0,
-            gl.RGBA,
-            gl.UNSIGNED_BYTE,
-            new Uint8Array([r, g, b, a]),
-        );
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.bindTexture(gl.TEXTURE_2D, null);
-        return new Texture(handle, 1, 1);
+    /** Recreate the GL object and re-upload, after the context has been restored. */
+    public reload(gl: WebGL2RenderingContext): void {
+        if (this.disposed) return;
+        const options = this.source?.options ?? {};
+        this.handle = createHandle(gl, options);
+        upload(gl, this.handle, this.source?.image ?? null, this.pixels, this.premultiplied);
     }
 
-    /** Release GPU resources */
     public dispose(gl: WebGL2RenderingContext): void {
         if (this.disposed) return;
         this.disposed = true;

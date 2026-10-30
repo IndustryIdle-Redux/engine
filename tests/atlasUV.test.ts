@@ -1,17 +1,13 @@
 /**
  * Atlas sub-rect UV tests.
  *
- * This locks down a convention that is **extremely easy to get wrong and extremely hard to notice once wrong**:
- * the texture is uploaded with `UNPACK_FLIP_Y_WEBGL = true` (the whole atlas is flipped),
- * while `q.y = 1` in `SpriteBatch` is the **top** of the quad.
+ * Textures are uploaded with `UNPACK_FLIP_Y_WEBGL = true` (the atlas is flipped), while `q.y = 1`
+ * in `SpriteBatch` is the top of the quad. The sprite's top row `y` therefore needs
+ * `v0 = 1 - (y+h)/H`, not `y/H`; getting it wrong flips every sprite and samples the
+ * neighbouring region.
  *
- * So for the "top of the quad" to show the sprite's **top row** `y`, it must be `v0 = 1 - (y+h)/H`,
- * not the intuitive `y/H`. Getting it wrong shows up as **every sprite flipped vertically and sampling the neighboring region**
- * -- which looks like "sprites shredded into pieces".
- *
- * ⚠️ Note: when doing an orientation test with the **whole texture** (uvPos=0, uvSize=1),
- * both formulas give 0, so this bug **cannot be caught**. A non-full sub-rect must be used,
- * which is also why this file exists.
+ * A whole-texture test (uvPos=0, uvSize=1) gives 0 for both formulas and cannot catch this,
+ * so the tests use a non-full sub-rect.
  */
 
 import { describe, expect, it } from "vitest";
@@ -21,10 +17,8 @@ const ATLAS_W = 1024;
 const ATLAS_H = 1024;
 
 /**
- * Simulate GPU sampling: given a relative position `q` on the quad (0=bottom, 1=top),
- * work backward to the **image row** of the atlas that it samples.
- *
- * Basis: the texture is uploaded with UNPACK_FLIP_Y_WEBGL=true ⇒ `image row = (1 - v) · H`.
+ * Simulate GPU sampling: given a position `q` on the quad (0=bottom, 1=top), return the image
+ * row it samples. Texture upload flips Y, so `image row = (1 - v) * H`.
  */
 function sampledImageRow(v0: number, dv: number, q: number): number {
     const v = v0 + q * dv;

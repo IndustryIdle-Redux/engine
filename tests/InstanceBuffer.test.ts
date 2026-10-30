@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Color } from "../src/Color";
 import { FLOATS_PER_INSTANCE, InstanceBuffer } from "../src/InstanceBuffer";
 
-/** Field offsets (matching InstanceBuffer's layout constants, spelled out here for readability) */
+/** Field offsets into an instance, spelled out for readability */
 const F = {
     x: 0,
     y: 1,
@@ -83,13 +83,8 @@ describe("InstanceBuffer color normalization", () => {
         expect(buf.at(0, F.a)).toBeCloseTo(1, 6);
     });
 
-    it("opacity affects only alpha and does not premultiply RGB (aligns with Cocos)", () => {
-        // ⚠️ This used to assert `r === 128/255` (i.e. RGB was premultiplied by opacity too).
-        // That was **wrong**: the renderer's blend mode is `SRC_ALPHA, ONE_MINUS_SRC_ALPHA`
-        // (straight alpha, see `Renderer2D.ts:75`); premultiplying multiplies alpha twice,
-        // so the actual contribution becomes opacity². The symptom was that **the negative (red) values of the tile modifier overlay were 4.6x too dark**,
-        // and spinner fade-outs and construction translucency were all too dark as well.
-        // Cocos writes opacity only into the vertex alpha (`v_color = (r,g,b,a·opacity)`).
+    it("opacity affects only alpha and does not premultiply RGB", () => {
+        // The blend is straight alpha, so premultiplying RGB by opacity here would apply it twice.
         const buf = new InstanceBuffer(2);
         buf.push({ x: 0, y: 0, w: 1, h: 1, color: new Color(255, 255, 255, 200), opacity: 128 });
         expect(buf.at(0, F.r)).toBeCloseTo(1, 6); // RGB stays as-is
@@ -149,14 +144,14 @@ describe("InstanceBuffer capacity management", () => {
     });
 });
 
-describe("InstanceBuffer gains over the original Cocos approach", () => {
-    it("10k sprites occupy a single TypedArray (the original was 10k cc.Node / 28.7MB of heap)", () => {
+describe("InstanceBuffer capacity", () => {
+    it("10k sprites occupy a single TypedArray", () => {
         const buf = new InstanceBuffer(16);
         for (let i = 0; i < 10000; i++) {
             buf.push({ x: i % 100, y: Math.floor(i / 100), w: 32, h: 32, u0: 0.1, v0: 0.2, du: 0.05, dv: 0.05 });
         }
         expect(buf.count).toBe(10000);
-        // 10000 × 16 × 4 bytes = 640 KB (versus the original 28.7 MB of heap)
+        // 10000 * 16 * 4 bytes = 640 KB
         expect(buf.view().byteLength).toBe(10000 * 16 * 4);
         expect(buf.view().byteLength).toBeLessThan(700_000);
     });
