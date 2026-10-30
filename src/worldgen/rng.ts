@@ -1,19 +1,8 @@
 /**
- * Deterministic randomness -- **bit-for-bit identical** to the game's existing implementation.
+ * Deterministic randomness matching the game's `xmur3` + `sfc32` (`shared/util/Helper.ts`).
  *
- * The original lives in `shared/util/Helper.ts` (`xmur3` + `sfc32`) and is used for map generation
- * (`srand(seed)` inside `World.generateMap`). Because the map layout must be reproducible
- * (the same seed must produce the same deposit distribution on the official client and in this implementation),
- * the algorithm, multiplier constants and shift amounts here are ported verbatim from the original.
- *
- * Reproduction basis (Helper.ts):
- * ```
- * xmur3(str):  h = 1779033703 ^ len; for c: h = imul(h ^ c, 3432918353); h = (h<<13)|(h>>>19)
- *              return () => { h = imul(h ^ h>>>16, 2246822507); h = imul(h ^ h>>>13, 3266489909); return (h ^= h>>>16) >>> 0 }
- * srand(s):    seed = xmur3(s); return sfc32(seed(), seed(), seed(), seed())
- * sfc32(a,b,c,d): t = (a+b|0)+d|0; d = d+1|0; a = b ^ b>>>9; b = (c + (c<<3))|0;
- *                 c = (c<<21)|(c>>>11); c = c+t|0; return (t>>>0)/4294967296
- * ```
+ * The constants and shift sequence are reproduced verbatim so the same seed yields the same
+ * values, and therefore the same map layout, as the original client.
  */
 
 /** xmur3 string hash (returns a 32-bit unsigned generator) */
@@ -55,11 +44,11 @@ export function srand(seed: string): () => number {
 }
 
 /**
- * Pick one element from an array using a random function.
+ * Pick one element from an array using a random function, matching the game's
+ * `Array.prototype.randOne` (`this[Math.floor(this.length * rnd())]`).
  *
- * Matches the game's `Array.prototype.randOne` (`Extensions.ts`):
- * `this[Math.floor(this.length * rnd())]`
+ * Returns `undefined` for an empty array.
  */
-export function randOne<T>(arr: readonly T[], rnd: () => number): T {
-    return arr[Math.floor(arr.length * rnd())] as T;
+export function randOne<T>(arr: readonly T[], rnd: () => number): T | undefined {
+    return arr[Math.floor(arr.length * rnd())];
 }

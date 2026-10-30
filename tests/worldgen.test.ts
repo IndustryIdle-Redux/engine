@@ -1,10 +1,10 @@
 /**
  * World generation tests.
  *
- * Key point: **the deposit distribution must match the original** (same seed, same map) -- otherwise the resource layout players see changes.
- * So the reference data here is not derived, it comes from:
- *  - RNG: an implementation that is byte-for-byte identical to `Helper.ts`'s `xmur3`+`sfc32`
- *  - iteration order: the order obtained by **actually running the honeycomb library** (row-major, `q = col - floor(row/2)`)
+ * The deposit distribution must match the original for the same seed and map, otherwise the
+ * resources players see change. Reference data comes from:
+ *  - RNG: the same xmur3+sfc32 implementation as `Helper.ts`
+ *  - iteration order: actually running the honeycomb library
  *  - generation rules: aligned with `World.generateMap` item by item
  */
 
@@ -13,6 +13,27 @@ import { randOne, srand, xmur3 } from "../src/worldgen/rng";
 import { forEachTile, hexOffsetToKey, tileKey, tileToWorld, worldToTile } from "../src/worldgen/gridLayout";
 import { depositsToArray, generateWorld, placeBuildings } from "../src/worldgen/generateWorld";
 import type { MapSpec } from "../src/worldgen/generateWorld";
+import { hexCenter, hexCornerOffsets, hexMetrics } from "../src/renderer/GridGeometry";
+
+/** Bounding size of all hex tile corners, in world pixels. */
+function hexWorldExtents(size: number, tileSize: number): { width: number; height: number } {
+    const m = hexMetrics(tileSize);
+    const corners = hexCornerOffsets(tileSize);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    forEachTile("hex", size, (_coord, col, row) => {
+        const c = hexCenter(col, row, m);
+        for (const corner of corners) {
+            minX = Math.min(minX, c.x + corner.x);
+            maxX = Math.max(maxX, c.x + corner.x);
+            minY = Math.min(minY, c.y + corner.y);
+            maxY = Math.max(maxY, c.y + corner.y);
+        }
+    });
+    return { width: maxX - minX, height: maxY - minY };
+}
 
 /* ------------------------------------------------------------------ *
  * RNG: bit-for-bit identical to the game's Helper.ts
@@ -82,7 +103,12 @@ describe("RNG is bit-for-bit identical to the original", () => {
         let s = 0;
         const rnd = (): number => (s += 0.13) % 1;
         const mine = randOne(arr, rnd);
-        expect(arr.indexOf(mine)).toBe(Math.floor(arr.length * ((0 + 0.13) % 1)));
+        expect(mine).toBeDefined();
+        expect(arr.indexOf(mine as string)).toBe(Math.floor(arr.length * ((0 + 0.13) % 1)));
+    });
+
+    it("randOne returns undefined for an empty array", () => {
+        expect(randOne([], () => 0)).toBeUndefined();
     });
 });
 
@@ -92,12 +118,8 @@ describe("RNG is bit-for-bit identical to the original", () => {
 
 describe("Grid iteration order (reference from actually running honeycomb)", () => {
     it("the key sequence of a 4×3 hex grid is exactly the same as honeycomb's", () => {
-        // Reference: actually running `ui/Lib/honeycomb.js` from the original repo
-        //   `defineGrid(extendHex({size:32})).rectangle({width:4,height:3}).forEach(...)`
-        //   ⇒ key = `${hex.x},${hex.y}`, which **is the plain offset coordinate (col,row)**
-        //     "0,0 1,0 2,0 3,0 0,1 1,1 2,1 3,1 0,2 1,2 2,2 3,2"
-        // ⚠️ This used to assert an **axial** sequence (containing `"-1,2"`) -- that is the engine's own convention
-        // and is not the same thing as honeycomb's `hex.x/hex.y`; it makes keys with row≥2 point at different tiles.
+        // honeycomb's rectangle({width:4,height:3}).forEach yields the plain offset keys
+        // "0,0 1,0 2,0 3,0 0,1 1,1 2,1 3,1 0,2 1,2 2,2 3,2".
         const expected = ["0,0", "1,0", "2,0", "3,0", "0,1", "1,1", "2,1", "3,1", "0,2", "1,2", "2,2", "3,2"];
         // forEachTile uses maxTile for both width and height; only the first 3 rows are taken here to match 4×3
         const filtered: string[] = [];
@@ -108,7 +130,7 @@ describe("Grid iteration order (reference from actually running honeycomb)", () 
     });
 
     it("key = offset coordinate (col,row) (honeycomb's hex.x/hex.y)", () => {
-        // For a pointy-top hexagon, honeycomb's Hex.x/y is just (column, row), **not axial q,r**
+        // For a pointy-top hexagon, honeycomb's Hex.x/y is (column, row), not axial q,r.
         expect(hexOffsetToKey(0, 0)).toEqual({ x: 0, y: 0 });
         expect(hexOffsetToKey(3, 0)).toEqual({ x: 3, y: 0 });
         expect(hexOffsetToKey(0, 1)).toEqual({ x: 0, y: 1 });
@@ -116,14 +138,10 @@ describe("Grid iteration order (reference from actually running honeycomb)", () 
         expect(hexOffsetToKey(3, 2)).toEqual({ x: 3, y: 2 });
     });
 
-    it("square grid order is **column-major** (aligning with the original `SquareGrid`'s for(x) for(y))", () => {
-        // ⚠️ This one used to assert **row-major** `["0,0","1,0","0,1","1,1"]` -- that was copied from the engine's implementation
-        // and does not match the original. The original `CoreGame/SquareGrid.ts:13-17` is:
-        //     for (let x = 0; x < maxTile; x++)
-        //         for (let y = 0; y < maxTile; y++)
-        // i.e. x outer / y inner ⇒ key order `"0,0","0,1","1,0","1,1"`.
-        // This is not a question of "does the order look nice": `generateWorld` consumes `rand()` tile by tile,
-        // and with the wrong order the deposit distribution for the same seed differs from the original (**save incompatibility**).
+    it("square grid order is column-major (aligning with the original `SquareGrid`)", () => {
+        // The original iterates x outer / y inner, so keys are "0,0","0,1","1,0","1,1".
+        // Order matters: generateWorld consumes rand() tile by tile, so a different order
+        // changes the deposit distribution for the same seed.
         const seq: string[] = [];
         forEachTile("square", 2, (coord) => seq.push(tileKey(coord)));
         expect(seq).toEqual(["0,0", "0,1", "1,0", "1,1"]);
@@ -141,12 +159,8 @@ describe("Tile → world coordinates", () => {
         expect(p.y).toBeCloseTo(32, 3);
     });
 
-    it("the first tile of hex row 2 is positioned correctly (aligned with the measured honeycomb output)", () => {
-        // honeycomb.js actually run (size=32): key "0,1" → (55.43, 80)
-        //   x = √3R/2 + √3R/2 (odd rows shift right by half a tile) = 27.713 + 27.713
-        //   y = R + 1.5R = 32 + 48 = 80
-        // ⚠️ This used to assert `p.y = 32 - 48 = -16` (y **decreasing** with row) --
-        // that came from mistaking honeycomb's +y for "downward" and negating y, producing a vertical mirror of the whole map.
+    it("the first tile of hex row 1 is positioned correctly (aligned with honeycomb output)", () => {
+        // size=32, key "0,1" → (55.43, 80): odd rows shift right by √3R/2, y = R + 1.5R.
         const p = tileToWorld("hex", { x: 0, y: 1 }, 0, 1, 10, 32);
         expect(p.x).toBeCloseTo(27.713 + 27.713, 3);
         expect(p.y).toBeCloseTo(32 + 48, 3);
@@ -158,9 +172,7 @@ describe("Tile → world coordinates", () => {
         expect(tileToWorld("square", { x: 2, y: 9 }, 2, 9, 10, 50)).toEqual({ x: 125, y: 475 });
     });
 
-    it("regression: square coordinates are **not Y-flipped**, and land at tile centers rather than tile corners", () => {
-        // The former wrong implementation: (col*tile, (maxTile-row)*tile)
-        //   → it treated tile centers as tile corners (off by half a tile) and flipped vertically (off by maxTile tiles, up to 4975px)
+    it("square coordinates are not Y-flipped and land at tile centers", () => {
         const maxTile = 100;
         const tile = 50;
         const row0 = tileToWorld("square", { x: 0, y: 0 }, 0, 0, maxTile, tile);
@@ -174,7 +186,7 @@ describe("Tile → world coordinates", () => {
         expect(row1.y).toBeGreaterThan(row0.y);
         expect(row1.y - row0.y).toBe(tile);
 
-        // 3) The last row is still inside the grid (the old implementation ran to 5000, past the size=5000 boundary)
+        // 3) The last row is still inside the grid
         const last = tileToWorld("square", { x: 99, y: 99 }, 99, 99, maxTile, tile);
         expect(last.x).toBe(4975);
         expect(last.y).toBe(4975);
@@ -314,6 +326,15 @@ describe("World generation", () => {
         expect(withBuilding.deposits.map((d) => d.key)).toEqual(["1,0"]);
     });
 
+    it("without canBuild no building tile is skipped", () => {
+        const w = generateWorld(
+            { ...TEST_MAP, resourceTiles: { "0,0": true, "1,0": true } },
+            "seed-x",
+            { buildings: { "0,0": { type: "HQ" } } },
+        );
+        expect(w.deposits.map((d) => d.key).sort()).toEqual(["0,0", "1,0"]);
+    });
+
     it("deposit world coordinates match the tile center", () => {
         const w = generateWorld(TEST_MAP, "seed-1");
         const d = w.deposits[0];
@@ -321,6 +342,30 @@ describe("World generation", () => {
         const tile = w.tiles.find((t) => t.key === d.key);
         expect(d.x).toBeCloseTo(tile?.x ?? 0, 6);
         expect(d.y).toBeCloseTo(tile?.y ?? 0, 6);
+    });
+});
+
+describe("World extents", () => {
+    it("hex worldWidth/worldHeight equal the hex tile bounds", () => {
+        const size = 20;
+        const tileSize = 32;
+        const w = generateWorld({ ...TEST_MAP, size, tileSize }, "extent-seed");
+        const bounds = hexWorldExtents(size, tileSize);
+        expect(w.worldWidth).toBeCloseTo(bounds.width, 6);
+        expect(w.worldHeight).toBeCloseTo(bounds.height, 6);
+    });
+
+    it("hex height includes the half tile above the top row's center", () => {
+        const size = 20;
+        const tileSize = 32;
+        const w = generateWorld({ ...TEST_MAP, size, tileSize }, "extent-seed");
+        expect(w.worldHeight).toBeCloseTo(1.5 * tileSize * size + tileSize / 2, 9);
+    });
+
+    it("square world size is size × tileSize", () => {
+        const w = generateWorld({ ...TEST_MAP, gridType: "square", size: 10, tileSize: 50 }, "square-seed");
+        expect(w.worldWidth).toBe(500);
+        expect(w.worldHeight).toBe(500);
     });
 });
 
@@ -341,19 +386,17 @@ describe("Building placement", () => {
 });
 
 /* ------------------------------------------------------------------ *
- * Performance: the generation stage no longer creates nodes
+ * Generation cost
  * ------------------------------------------------------------------ */
 
-describe("Cost of the generation stage (versus the original's 10,000 cc.Label)", () => {
-    it("100×100 map generation + no GPU/node operations at all", () => {
+describe("Generation cost", () => {
+    it("100×100 map generation performs no GPU/node work", () => {
         const big: MapSpec = { ...TEST_MAP, size: 100 };
         const t0 = performance.now();
         const w = generateWorld(big, "perf-seed");
         const ms = performance.now() - t0;
         expect(w.tiles).toHaveLength(10000);
-        // The original creates 10,000 cc.Label nodes at this step (about 28.7 MB of heap)
-        // Pure data generation should be within a few tens of milliseconds
         expect(ms).toBeLessThan(200);
-        console.log(`100×100 generation: ${ms.toFixed(2)} ms, ${w.deposits.length} deposits, 0 nodes`);
+        console.log(`100×100 generation: ${ms.toFixed(2)} ms, ${w.deposits.length} deposits`);
     });
 });

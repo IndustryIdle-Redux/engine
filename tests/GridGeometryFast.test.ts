@@ -1,12 +1,13 @@
 /**
  * Correctness and performance of grid generation without dedup (`buildHexGridLinesFast`).
  *
- * Correctness criterion: **the produced edge set must be exactly identical to the dedup version** (compared edge by edge, order ignored).
- * This is a hard constraint of the refactor -- one edge short means a missing grid line, one edge extra means double drawing.
+ * Correctness criterion: the produced edge set must be identical to the dedup version
+ * (compared edge by edge, order ignored), because one missing edge means a missing grid line
+ * and one extra edge means double drawing.
  */
 
 import { describe, expect, it } from "vitest";
-import { buildHexGridLines, buildHexGridLinesFast } from "../src/renderer/GridGeometry";
+import { buildHexGridLines, buildHexGridLinesFast, gridLineCount } from "../src/renderer/GridGeometry";
 import type { LineSegment } from "../src/renderer/GridGeometry";
 
 /** Normalize edges into an order-independent key set */
@@ -59,6 +60,11 @@ describe("buildHexGridLinesFast matches the dedup version's edge set", () => {
         expect(fast.length).toBeGreaterThan(3 * n * n);
         expect(fast.length).toBeLessThan(3 * n * n + 8 * n);
         expect(fast.length).toBeLessThan(naive * 0.6);
+    });
+
+    it("gridLineCount reports the fast builder's count", () => {
+        const visible = { x: -200, y: -150, width: 900, height: 700 };
+        expect(gridLineCount("hex", 20, 32, visible)).toBe(buildHexGridLinesFast(20, 32, visible).length);
     });
 });
 

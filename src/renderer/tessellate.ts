@@ -1,15 +1,8 @@
 /**
- * Geometry triangulation and stroke expansion (pure functions, unit-testable).
+ * Pure 2D geometry generation: stroke expansion, polygon triangulation, and line dashing.
  *
- * Replaces the capability of Cocos `cc.Graphics`: it does the same thing internally
- * (path → stroke/fill → triangulation → vertices), but **rebuilds on every `stroke()`**
- * -- which is exactly the root cause of the original `drawGrid` doing 10,000 strokes / 70,000 points at 14~23 ms each.
- *
- * Here "geometry generation" and "GPU submission" are completely separated:
- * geometry depends only on the input path (pure functions), so it can be **generated once and cached**,
- * and zooming/panning then only needs a different projection matrix, not a rebuild.
- *
- * Output is uniformly a triangle list (one triangle per 3 vertices), convenient for a single `drawArrays`.
+ * Output is uniformly a triangle list (one triangle per 3 vertices) so callers can submit it
+ * in a single draw call and cache it independently of the projection matrix.
  */
 
 export interface Point {
@@ -25,10 +18,10 @@ export type TriangleVertices = number[];
  * ------------------------------------------------------------------ */
 
 /**
- * Expand one polyline into a stroke triangle strip.
+ * Expand one polyline into a stroke triangle list.
  *
- * Approach: each segment produces one quad (2 triangles), and adjacent segments are joined with a **miter**;
- * the miter length is limited by `miterLimit`, and beyond that it degrades to a bevel (to avoid spikes at sharp corners).
+ * Each segment produces one quad; adjacent segments are joined with a miter whose length is
+ * capped by `miterLimit` to avoid spikes at sharp corners.
  *
  * @param points polyline vertices (at least 2 points)
  * @param width line width (pixels)
@@ -162,10 +155,9 @@ function pointInTriangle(px: number, py: number, a: Point, b: Point, c: Point): 
 }
 
 /**
- * Ear-clipping triangulation for a simple polygon (vertices are expected counter-clockwise; the winding is normalized internally).
+ * Ear-clipping triangulation for a simple polygon. The winding is normalized internally.
  *
- * Complexity O(n²) -- good enough for this project's uses (range circles, selection highlights, hexagon fills, n ≤ a few dozen).
- * If very large polygons ever need filling, switch to a sweep line / monotone decomposition then.
+ * O(n²), which is sufficient for range circles, selection highlights and hexagon fills.
  */
 export function triangulatePolygon(points: readonly Point[]): TriangleVertices {
     const out: TriangleVertices = [];
@@ -284,7 +276,7 @@ export function regularPolygonPath(
     return pts;
 }
 
-/** Dashed line: cut a segment into dashes (replaces the original `cc.Graphics.prototype.dashedLine` monkey patch) */
+/** Dashed line: cut a segment into dash/gap pieces. */
 export function dashSegment(
     x0: number,
     y0: number,
@@ -298,6 +290,8 @@ export function dashSegment(
     const dy = y1 - y0;
     const len = Math.hypot(dx, dy);
     if (len < 1e-9) return out;
+    // A non-positive step would never advance the loop.
+    if (dashLength < 0 || gapLength < 0 || dashLength + gapLength <= 0) return out;
     const ux = dx / len;
     const uy = dy / len;
     const step = dashLength + gapLength;

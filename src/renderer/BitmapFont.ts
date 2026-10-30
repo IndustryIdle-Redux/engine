@@ -1,21 +1,8 @@
 /**
- * Bitmap font — replaces Cocos's `cc.Label` / `cc.BitmapFont`.
+ * Bitmap font: glyph metrics, text layout, and instance emission.
  *
- * ### Why `cc.Label` had to go
- * The original creates one `cc.Label` node **per map tile** to draw overlay text:
- * a 100×100 map = **10,000 nodes, 28.7 MB of JS heap**,
- * and extrapolating `showTileModifiers` stalls for roughly **442 ms** (measured: 3,000 tiles in 132.6 ms).
- *
- * A bitmap font turns all that into pure data: **one instance per character** written into `InstanceBuffer`,
- * sharing the same batched rendering pipeline as sprites. 10,000 tiles × 3 characters = 30,000 instances ≈ 1.9 MB of `Float32Array`,
- * and they are **generated only for the visible area** (after frustum culling usually only a few hundred instances remain).
- *
- * ### Glyph data
- * Two supported sources:
- *  1. load a bitmap font atlas from an image (AngelCode BMFont's `.fnt` text format)
- *  2. give each glyph's UV rect and metrics directly in code (what this project does: glyphs are sliced from an existing atlas)
- *
- * All metrics are in **world pixels** (the actual rendered size at fontSize).
+ * A glyph source is either an AngelCode BMFont atlas or explicit UV rectangles sliced from
+ * an existing atlas. All metrics are in world pixels.
  */
 
 import type { SpriteDrawCall } from "../InstanceBuffer";
@@ -64,11 +51,7 @@ export interface BitmapFontOptions {
     spaceWidth?: number;
 }
 
-/**
- * Bitmap font.
- *
- * Immutable: read-only after loading; many texts share the same instance.
- */
+/** Bitmap font. Immutable after loading, so many texts can share one instance. */
 export class BitmapFont {
     private readonly glyphs = new Map<number, Glyph>();
     public readonly lineHeight: number;
@@ -79,9 +62,8 @@ export class BitmapFont {
     /**
      * Distance from the baseline to the top of the line (i.e. BMFont's `common.base`).
      *
-     * Used by `baselineForCenterY()`: converts "the text's visual center" into the baseline that `layout()` needs.
-     * It defaults to `lineHeight / 2`, in which case the conversion is a **zero adjustment** —
-     * suitable for fonts whose glyphs are already drawn centered (e.g. fonts drawn live by Canvas).
+     * Used by `baselineForCenterY()` to convert a text's visual center into a baseline.
+     * Defaults to `lineHeight / 2`, which makes that conversion a zero adjustment.
      */
     public readonly ascent: number;
 
@@ -94,14 +76,9 @@ export class BitmapFont {
     }
 
     /**
-     * Given the Y of the "text's visual center", find the **baseline** Y that `layout()` needs.
+     * Given the Y of a text's visual center, return the baseline Y that `layout()` expects.
      *
-     * Background: `layout()`'s 3rd parameter is the **baseline**, whereas the coordinates of
-     * `Level` / UI labels in Cocos prefabs are the **node center** (anchor 0.5). The two differ by
-     * `ascent - lineHeight/2` (a positive value means the line's center is above the baseline).
-     *
-     * Example: Overpass BMFont (base=32, lineHeight=42, scale=0.5) differs by 5.5 world pixels;
-     * without the conversion the level digits come out **about 5 pixels too high** overall.
+     * The two differ by `(ascent - lineHeight/2) * fontSize / baseSize`.
      */
     public baselineForCenterY(centerY: number, fontSize: number): number {
         const scale = fontSize / this.baseSize;
@@ -114,7 +91,7 @@ export class BitmapFont {
         return this;
     }
 
-    /** Register many at once (compact form, handy for slicing a whole atlas) */
+    /** Register many glyphs at once */
     public setGlyphs(entries: Array<[string, Glyph]>): this {
         for (const [ch, g] of entries) this.setGlyph(ch, g);
         return this;
@@ -133,9 +110,7 @@ export class BitmapFont {
     }
 
     /**
-     * Measure text width (pixels; `scale` scales the design font size up to the target fontSize).
-     *
-     * No line wrapping — this measures a single line. Multiple lines are stacked by the caller using `lineHeight`.
+     * Measure a single line of text (pixels); `scale` maps the design size to the target fontSize.
      */
     public measure(text: string, scale = 1): number {
         let w = 0;
@@ -155,13 +130,12 @@ export class BitmapFont {
     }
 
     /**
-     * Lay out a piece of text into glyph instances (**no instance allocation**: results are written into the caller-provided array).
+     * Lay out one line of text into glyph instances, writing into the caller-provided array
+     * (cleared first) so the hot path allocates nothing.
      *
-     * @param text the text
      * @param x starting world X (left/center/right edge depending on align)
      * @param y baseline world Y
      * @param fontSize target font size
-     * @param align horizontal alignment
      * @param out output array (cleared and then filled)
      */
     public layout(
@@ -195,13 +169,11 @@ export class BitmapFont {
     }
 
     /**
-     * Write the layout result straight into the sprite instance buffer (**the core path: text also goes through batching**).
-     *
-     * This is the key step replacing "one `cc.Label` node per tile":
-     * text no longer produces any nodes, just a handful of instances.
+     * Write a layout result straight into the sprite instance buffer, so text goes through
+     * the same batch as sprites.
      *
      * @param layout obtained from `layout()`
-     * @param push callback that writes a single instance (usually a wrapper around `SpriteBatch.draw`)
+     * @param push callback that writes a single instance
      */
     public emit(
         layout: readonly LaidOutGlyph[],
@@ -231,10 +203,10 @@ export class BitmapFont {
 }
 
 /**
- * Slice an atlas on a uniform grid to build a bitmap font (most common: digit/percentage overlays).
+ * Slice an atlas on a uniform grid to build a monospace font (digits, `.`, `%`, `-`, ...).
  *
- * Use case: `NUMBER_SUFFIX`-style overlay text that only needs `0-9 . % -` —
- * no full font needed at all, slicing 14 glyphs is enough.
+ * `tileU` / `tileDu` / `tileDv` are in atlas UV space and already include any padding around
+ * the grid; `padding` trims further inside each tile to avoid bleeding between glyphs.
  */
 export function buildMonospaceFont(
     chars: string,
@@ -252,7 +224,6 @@ export function buildMonospaceFont(
         lineHeight?: number;
     },
 ): BitmapFont {
-    void tileU;
     const { baseSize, padding = 0, renderScale = 1 } = opts;
     const font = new BitmapFont(baseSize, opts.lineHeight !== undefined ? { lineHeight: opts.lineHeight } : {});
     const size = baseSize * renderScale;
@@ -262,7 +233,7 @@ export function buildMonospaceFont(
         const col = i % columns;
         const row = Math.floor(i / columns);
         font.setGlyph(ch, {
-            u0: col * tileDu + (tileDu * padding) / size,
+            u0: tileU + col * tileDu + (tileDu * padding) / size,
             v0: row * tileDv + (tileDv * padding) / size,
             du: tileDu - (tileDu * padding * 2) / size,
             dv: tileDv - (tileDv * padding * 2) / size,
@@ -275,7 +246,6 @@ export function buildMonospaceFont(
     }
     return font;
 }
-
 
 /* ------------------------------------------------------------------ *
  * Generate a compact bitmap font from a Canvas
@@ -301,16 +271,8 @@ export interface CanvasFontResult {
 }
 
 /**
- * Draw a bitmap font live on a Canvas, **tightly packed by actual glyph width**.
- *
- * ### Why it is needed
- * With uniform packing ("each cell = font size", what the Demo did at first), digit spacing comes out more than 2× the original:
- * the game's level digits come from `cc.Label` (system font), size 32 with node scale 0.5,
- * and the `contentSize` of a two-digit number is only 24.38px — i.e. about 12px per digit, roughly **0.38×** the font size.
- * Uniform packing gives 1.0×, so digits come out visibly too wide and do not line up with the buildings.
- *
- * Here we first `measureText` each character's true width, then pack them tightly in order,
- * so `advance` matches the real font.
+ * Draw a bitmap font live on a Canvas, packed by actual glyph width so `advance` matches
+ * the real font.
  */
 export function createCanvasFont(chars: string, options: CanvasFontOptions): CanvasFontResult {
     const {

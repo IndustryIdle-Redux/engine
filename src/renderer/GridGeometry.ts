@@ -1,20 +1,8 @@
 /**
- * Grid line geometry generation (pure functions, cacheable, unit-testable).
+ * Grid line geometry generation (pure, cacheable).
  *
- * Replaces `HexagonGrid.drawGrid` / `SquareGrid.drawGrid` (the original used `cc.Graphics`).
- *
- * ### How expensive the original was (measured)
- * - **square**: `2×maxTile` segments, but **each one calls `stroke()` separately** → 200 stroke calls
- * - **hex**: **each hexagon becomes its own path + a separate `stroke()`** → 10,000 stroke calls, 70,000 points
- *
- * ### The three layers of optimization here
- * 1. **Batch into a single vertex buffer**: one submit instead of per-segment `stroke()`
- * 2. **Shared-edge dedup**: for hex, each adjacent pair of edges is drawn once → from 6 per tile down to about 3 per tile
- * 3. **Generate only the visible area**: derive the row/column range from the camera viewport, so the geometry depends only on **viewport size**,
- *    not on the map's total tile count (max 100×100)
- *
- * Point 3 matters most — it makes "rebuild the grid on zoom" meaningless in the first place:
- * the visible area has at most a few thousand edges, so rebuild cost drops from 14~23 ms to sub-millisecond.
+ * Both builders return line segments in world pixels. An optional visible rect restricts the
+ * generated range so the output depends on viewport size rather than map size.
  */
 
 import { Vec2 } from "../Vec2";
@@ -38,10 +26,9 @@ export interface VisibleRect {
 /**
  * Build square grid lines.
  *
- * **Semantically equivalent to the original**: the original starts at `(0,0)` and draws to `maxTile` in steps of `tileSize`,
- * i.e. in the x direction from `0 .. (maxTile-1)*tileSize`, with line length `size.y`.
- * Here we additionally support generating only the visible area (when `visible` is passed),
- * so **line positions still line up exactly with the original** (locked down by unit tests).
+ * Lines run at multiples of `tileSize` from 0 to `(maxTile-1)*tileSize`, i.e. `maxTile` lines
+ * per axis. The final row/column boundary is deliberately not drawn, matching the vanilla
+ * renderer; tests lock this behavior down.
  */
 export function buildSquareGridLines(
     maxTile: number,
@@ -49,7 +36,7 @@ export function buildSquareGridLines(
     visible?: VisibleRect,
 ): LineSegment[] {
     const lines: LineSegment[] = [];
-    // the original's range
+    // line positions run over 0 .. (maxTile-1)*tileSize
     const worldMinX = 0;
     const worldMaxX = (maxTile - 1) * tileSize;
     const worldMinY = 0;
@@ -83,7 +70,7 @@ export function buildSquareGridLines(
  * Pointy-top hexagons (consistent with the honeycomb library)
  * ------------------------------------------------------------------ */
 
-/** Geometric constants of a pointy-top hexagon (derived from the circumradius R, matching honeycomb's corners()) */
+/** Geometric constants of a pointy-top hexagon (derived from the circumradius R) */
 export interface HexMetrics {
     /** circumradius (= the game's tileSize) */
     radius: number;
@@ -108,17 +95,10 @@ export function hexMetrics(tileSize: number): HexMetrics {
 }
 
 /**
- * The 6 corners of a pointy-top hexagon (offsets relative to the center).
+ * The 6 corners of a pointy-top hexagon, relative to its center.
  *
- * **Precisely aligned with the honeycomb library** (verified against the real library output, size=32):
- *   corners() relative to the hex origin = (55.43,16) (55.43,48) (27.71,64) (0,48) (0,16) (27.71,0)
- *   origin + center() = tile center, center() = (width/2, height/2)
- *   ⇒ corners relative to the center = (0,-R) (0,R) (-√3R/2,R/2) ... mirror relation (see below)
- *
- * Two things to note:
- *  1. honeycomb has **+y pointing down**; this engine's world coordinates have **+y pointing up**, so y is negated
- *  2. the return order stays consistent with `corners()` (starting from "top-right" and going clockwise),
- *     so the resulting polygon matches the library's `forEach` order, and so does the deduped edge set
+ * honeycomb has +y downward while world coordinates have +y upward, so y is negated. The
+ * order matches honeycomb's `corners()` (top-right, clockwise) so the shared edge set matches.
  */
 export function hexCornerOffsets(tileSize: number): Array<{ x: number; y: number }> {
     const R = tileSize;
@@ -136,22 +116,8 @@ export function hexCornerOffsets(tileSize: number): Array<{ x: number; y: number
 }
 
 /**
- * Grid coordinates (column col, row row) → world center coordinates. **Matches honeycomb's `toPoint()+center()` value by value**.
- *
- * Measured baseline (size=32, running the original repo's `ui/Lib/honeycomb.js` directly):
- * ```
- *   key "0,1" → ( 55.43,  80.00)
- *   key "1,2" → ( 83.14, 128.00)
- *   key "2,2" → (138.56, 128.00)
- * ```
- * ⇒ `x = √3R·(col + 0.5·(row&1)) + √3R/2`, `y = 1.5R·row + R`
- * (row step 48 = 1.5R, odd/even rows offset horizontally by 27.713 = √3R/2)
- *
- * ⚠️ **y used to be written as `m.height/2 - row*m.rowStep`** (i.e. y negated), on the grounds that
- * "honeycomb's +y points down, this engine's +y points up" — **that reasoning does not hold**:
- * the original used honeycomb's `toPoint()+center()` directly as Cocos world coordinates
- * (`CoreGame/HexagonGrid.ts:29-33`), and this engine's camera also has +y pointing up
- * (`Camera2D`), with no second flip to cancel it out. The result was **the whole hexagon map mirrored vertically**.
+ * Grid coordinates (col, row) → world center coordinates, matching honeycomb's
+ * `toPoint() + center()`: `x = √3R·(col + 0.5·(row&1)) + √3R/2`, `y = 1.5R·row + R`.
  */
 export function hexCenter(col: number, row: number, m: HexMetrics): { x: number; y: number } {
     const x = (col + (row & 1 ? 0.5 : 0)) * m.colStep + m.width / 2;
@@ -165,10 +131,10 @@ function pointKey(x: number, y: number): string {
 }
 
 /**
- * Build pointy-top hexagon grid lines with **shared edges drawn only once**.
+ * Build pointy-top hexagon grid lines with shared edges drawn only once.
  *
- * @param maxTile tiles per side (the original's `maxTile`)
- * @param tileSize circumradius (the original's `tileSize`)
+ * @param maxTile tiles per side
+ * @param tileSize circumradius
  * @param visible generate grid lines only inside this world rect (omit to generate the whole map)
  */
 export function buildHexGridLines(maxTile: number, tileSize: number, visible?: VisibleRect): LineSegment[] {
@@ -181,11 +147,7 @@ export function buildHexGridLines(maxTile: number, tileSize: number, visible?: V
     let maxRow = maxTile - 1;
 
     if (visible) {
-        // Derive rows/cols from the visible rect (with a 1-tile margin, so edge lines are not missing)
-        // row: y = -row * rowStep  ⇒  row = -y / rowStep
-        // Inverse of `hexCenter`'s `y = height/2 + row*rowStep`:
-        // row = (worldY - height/2) / rowStep. This was once estimated from "y decreases with row",
-        // so after fixing y this had to change with it, otherwise visible-area culling picks the wrong rows and the edge sets do not match.
+        // Inverse of hexCenter's `y = height/2 + row*rowStep`, with a one-tile margin
         minRow = Math.max(0, Math.floor((visible.y - m.height / 2) / m.rowStep) - 1);
         maxRow = Math.min(maxTile - 1, Math.ceil((visible.y + visible.height - m.height / 2) / m.rowStep) + 1);
         minCol = Math.max(0, Math.floor(visible.x / m.colStep) - 1);
@@ -222,30 +184,11 @@ export function buildHexGridLines(maxTile: number, tileSize: number, visible?: V
 }
 
 /**
- * Hexagon grid line generation without dedup (**recommended**).
+ * Hexagon grid line generation without dedup.
  *
- * ### Why it is needed
- * `buildHexGridLines` uses "quantize both edge endpoints into string keys + a Set for dedup".
- * Measured with a fairly large visible area (zoom 0.5 → 2560×1600 world pixels, 5,723 edges) it took **2.99 ms**,
- * becoming the biggest cost in the whole frame — building and hashing string keys is far more expensive than the geometry itself.
- *
- * ### Key insight
- * Every edge is shared by exactly **two adjacent tiles**. If each tile emits only the 3 edges "it owns", and
- * boundary tiles additionally emit the edges whose "neighbor does not exist", we get a duplicate-free edge set with **one pass and zero dedup**.
- *
- * Edge-to-neighbor mapping (pointy-top hexagon, corner order in `hexCornerOffsets`):
- *
- * | Edge | Corners | Shared neighbor |
- * |------|---------|-----------------|
- * | E0   | 0→1     | east            |
- * | E1   | 1→2     | southeast       |
- * | E2   | 2→3     | southwest       |
- * | E3   | 3→4     | west            |
- * | E4   | 4→5     | northwest       |
- * | E5   | 5→0     | northeast       |
- *
- * This implementation lets each tile own **E0 / E4 / E5** (east, northwest, northeast),
- * and the other three are emitted when the corresponding neighbor is missing.
+ * Every edge is shared by two adjacent tiles. Each tile emits the three edges it owns
+ * (east E0, northeast E5, northwest E4); the remaining three are emitted only when the
+ * corresponding neighbor is outside the processed range. One pass, no hashing.
  */
 export function buildHexGridLinesFast(
     maxTile: number,
@@ -261,7 +204,7 @@ export function buildHexGridLinesFast(
     let minRow = 0;
     let maxRow = maxTile - 1;
     if (visible) {
-        // Inverse of `hexCenter`'s `y = height/2 + row*rowStep` (same as `buildHexGridLines`)
+        // Inverse of hexCenter's `y = height/2 + row*rowStep` (same as buildHexGridLines)
         minRow = Math.max(0, Math.floor((visible.y - m.height / 2) / m.rowStep) - 1);
         maxRow = Math.min(maxTile - 1, Math.ceil((visible.y + visible.height - m.height / 2) / m.rowStep) + 1);
         minCol = Math.max(0, Math.floor(visible.x / m.colStep) - 1);
@@ -275,10 +218,8 @@ export function buildHexGridLinesFast(
         lines.push({ x0: cx + a.x, y0: cy + a.y, x1: cx + b.x, y1: cy + b.y });
     };
 
-    // ⚠️ Deciding "does the neighbor exist" must be against **the tile range being processed**, not the whole map.
-    // Using the whole map makes the visible area's left/bottom boundary **drop edges**: when a neighbor is inside the map but outside the visible area,
-    // it is never processed, so it never emits that shared edge, while this tile assumes the neighbor will.
-    // (This bug was caught by the "visible-area culling edge sets match" case in `tests/GridGeometryFast.test.ts`.)
+    // Neighbor existence is checked against the processed range, not the whole map: a neighbor
+    // inside the map but outside the visible range never emits its shared edge.
     const inRange = (c: number, r: number): boolean =>
         c >= minCol && c <= maxCol && r >= minRow && r <= maxRow;
 
@@ -291,15 +232,9 @@ export function buildHexGridLinesFast(
             push(c.x, c.y, 5);
             push(c.x, c.y, 4);
 
-            // Emit the outer edges when the neighbor is missing (otherwise the grid's outermost boundary loses lines)
-            //
-            // ⚠️ The southwest/southeast neighbors are in **row - 1** (not row + 1):
-            // this tile owns east (E0) / northwest (E4) / northeast (E5), so southwest (E2) / southeast (E1)
-            // are emitted by the tile **one row below** in its "northwest/northeast" capacity;
-            // this tile only emits them when that neighbor **does not exist**.
-            // This used to be written as `row + 1`, which was correct back when y **decreased** with row;
-            // after fixing `hexCenter`'s y direction (to match the original honeycomb) it is backwards,
-            // and the symptom is **a flood of duplicate edges** (caught by the edge-set consistency case in `GridGeometryFast`).
+            // The west/southwest/southeast neighbors are emitted by other tiles; this tile only
+            // draws them when that neighbor is missing, so the map boundary keeps its lines.
+            // Southwest/southeast live in row - 1 (they see this tile as northeast/northwest).
             if (!inRange(col - 1, row)) push(c.x, c.y, 3); // west
             const swCol = odd ? col : col - 1;
             if (!inRange(swCol, row - 1)) push(c.x, c.y, 2); // southwest
@@ -310,7 +245,7 @@ export function buildHexGridLinesFast(
     return lines;
 }
 
-/** Estimate the line segment count (for perf assertions and debugging) */
+/** Count the line segments the renderer would build for the same parameters. */
 export function gridLineCount(
     kind: "square" | "hex",
     maxTile: number,
@@ -319,12 +254,16 @@ export function gridLineCount(
 ): number {
     return kind === "square"
         ? buildSquareGridLines(maxTile, tileSize, visible).length
-        : buildHexGridLines(maxTile, tileSize, visible).length;
+        : buildHexGridLinesFast(maxTile, tileSize, visible).length;
 }
 
-/** Expand line segments into a vertex array (for instancing / triangle submission) */
+/** Expand line segments into a [x0,y0,x1,y1,...] vertex array. Throws if `out` is too small. */
 export function linesToVertices(lines: LineSegment[], out?: Float32Array): Float32Array {
-    const arr = out ?? new Float32Array(lines.length * 4);
+    const needed = lines.length * 4;
+    if (out !== undefined && out.length < needed) {
+        throw new Error(`[grid] linesToVertices: output array too small (need ${needed}, got ${out.length})`);
+    }
+    const arr = out ?? new Float32Array(needed);
     for (let i = 0; i < lines.length; i++) {
         const l = lines[i] as LineSegment;
         arr[i * 4 + 0] = l.x0;

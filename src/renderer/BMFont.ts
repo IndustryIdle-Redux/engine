@@ -1,31 +1,12 @@
 /**
- * AngelCode BMFont (`.fnt`) parsing -- the font format the game actually uses.
+ * AngelCode BMFont (`.fnt`) parsing.
  *
- * ### Why it is needed
- * The `Level` label of `Building.prefab` is **not** a system font:
- * ```
- * _isSystemFontUsed = false
- * _N$file = { __uuid__: "52edec31-ce25-43fc-a275-61580b0565bc" }   // → assets/Fonts/Overpass.fnt
- * _fontSize = 32   _lineHeight = 20
- * ```
- * which means the level number uses the **Overpass SemiBold bitmap font**.
- * Rendering it with a monospace fallback font would give clearly different glyph widths and shapes,
- * so the `.fnt` is parsed directly here, guaranteeing that glyphs, kerning and baseline all match the original.
+ * Format: text lines of `key=value` pairs, for example:
+ *   common lineHeight=42 base=32 scaleW=256 scaleH=256 pages=1
+ *   char id=65 x=1 y=1 width=20 height=26 xoffset=1 yoffset=9 xadvance=16 page=0
  *
- * ### Format
- * `.fnt` is a text format, one `key=value` per line:
- * ```
- * info   face="Overpass SemiBold" size=42 padding=0,0,0,0 spacing=1,1
- * common lineHeight=42 base=32 scaleW=256 scaleH=256 pages=1
- * page   id=0 file="Overpass_0.png"
- * char   id=65 x=1 y=1 width=20 height=26 xoffset=1 yoffset=9 xadvance=16 page=0
- * ```
- *
- * ### Coordinate convention (critical)
- * BMFont has **+y downward**, and `yoffset` is the distance "from the line top to the glyph top";
- * the baseline position is `common.base`. This engine's world coordinates are **+y upward**,
- * and `BitmapFont`'s `offsetX/offsetY` mean the offset of the **glyph center relative to the pen position / baseline**,
- * so one conversion is needed (see `bMFontGlyphToGlyph`).
+ * BMFont uses +y downward and `yoffset` measured from the line top; this engine's world
+ * coordinates use +y upward with glyph offsets relative to the glyph center.
  */
 
 import { BitmapFont } from "./BitmapFont";
@@ -74,11 +55,17 @@ function parseKeyValues(line: string): Record<string, string> {
     return out;
 }
 
+/** Read a numeric field, falling back to 0 when it is absent or not finite. */
+function finiteOr(value: string | undefined): number {
+    const n = Number(value ?? 0);
+    return Number.isFinite(n) ? n : 0;
+}
+
 /**
  * Parse `.fnt` text.
  *
- * Fault tolerance: unknown lines (`kerning` etc.) and blank lines are ignored; missing fields get reasonable defaults,
- * so parsing does not fail wholesale because of font version differences.
+ * Unknown lines (`kerning` etc.) and blank lines are ignored; absent or non-finite numeric
+ * fields default to 0, so version differences do not make parsing fail wholesale.
  */
 export function parseBMFont(text: string): BMFontData {
     const data: BMFontData = {
@@ -102,28 +89,28 @@ export function parseBMFont(text: string): BMFontData {
         switch (kind) {
             case "info":
                 data.face = kv["face"] ?? "";
-                data.size = Number(kv["size"] ?? 0);
+                data.size = finiteOr(kv["size"]);
                 break;
             case "common":
-                data.lineHeight = Number(kv["lineHeight"] ?? 0);
-                data.base = Number(kv["base"] ?? 0);
-                data.scaleW = Number(kv["scaleW"] ?? 0);
-                data.scaleH = Number(kv["scaleH"] ?? 0);
+                data.lineHeight = finiteOr(kv["lineHeight"]);
+                data.base = finiteOr(kv["base"]);
+                data.scaleW = finiteOr(kv["scaleW"]);
+                data.scaleH = finiteOr(kv["scaleH"]);
                 break;
             case "page":
-                data.pages[Number(kv["id"] ?? 0)] = kv["file"] ?? "";
+                data.pages[finiteOr(kv["id"])] = kv["file"] ?? "";
                 break;
             case "char":
                 data.chars.push({
-                    id: Number(kv["id"] ?? 0),
-                    x: Number(kv["x"] ?? 0),
-                    y: Number(kv["y"] ?? 0),
-                    width: Number(kv["width"] ?? 0),
-                    height: Number(kv["height"] ?? 0),
-                    xoffset: Number(kv["xoffset"] ?? 0),
-                    yoffset: Number(kv["yoffset"] ?? 0),
-                    xadvance: Number(kv["xadvance"] ?? 0),
-                    page: Number(kv["page"] ?? 0),
+                    id: finiteOr(kv["id"]),
+                    x: finiteOr(kv["x"]),
+                    y: finiteOr(kv["y"]),
+                    width: finiteOr(kv["width"]),
+                    height: finiteOr(kv["height"]),
+                    xoffset: finiteOr(kv["xoffset"]),
+                    yoffset: finiteOr(kv["yoffset"]),
+                    xadvance: finiteOr(kv["xadvance"]),
+                    page: finiteOr(kv["page"]),
                 });
                 break;
             default:
@@ -137,11 +124,10 @@ export function parseBMFont(text: string): BMFontData {
 /**
  * BMFont glyph → engine glyph.
  *
- * Conversion (BMFont +y downward → this engine's +y upward, with offsets relative to the **glyph center**):
- *  - center relative to the pen position: `xoffset + width/2`
- *  - center relative to the baseline: `base - yoffset - height/2`
+ * The glyph center relative to the pen position is `xoffset + width/2`; relative to the
+ * baseline it is `base - yoffset - height/2`.
  *
- * @param glyphAtlasRect the glyph's rectangle inside the atlas (the font page offset is already folded in)
+ * @param uv the glyph's UV rectangle, with the font page offset already folded in
  */
 export function bMFontGlyphToGlyph(
     c: BMFontChar,
@@ -168,14 +154,21 @@ export interface FontPageRect {
     height: number;
 }
 
+function requirePositive(value: number, field: string): number {
+    if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`[bmfont] ${field} must be a finite positive number (got ${String(value)})`);
+    }
+    return value;
+}
+
 /**
- * Build a `BitmapFont` from a parsed BMFont plus atlas information.
+ * Build a `BitmapFont` from parsed BMFont data plus atlas information.
  *
- * @param data parse result
- * @param fontPageRect the rectangle of the font page (e.g. `Overpass.png`) **inside the atlas**
- * @param atlasWidth atlas width
- * @param atlasHeight atlas height
- * @param scale optional: scale the font design size to the target render size (default 1, i.e. render at the design size)
+ * Only single-page fonts are supported. Invalid metrics throw an `Error` prefixed with
+ * `[bmfont]` that names the offending field.
+ *
+ * @param fontPageRect the font page rectangle (e.g. `Overpass.png`) inside the atlas
+ * @param scale optional scale of the font design size (default 1)
  */
 export function createBitmapFontFromBMFont(
     data: BMFontData,
@@ -184,22 +177,42 @@ export function createBitmapFontFromBMFont(
     atlasHeight: number,
     scale = 1,
 ): BitmapFont {
-    const baseSize = (data.size || data.lineHeight) * scale;
+    // `pages` is sparse (indexed by page id), so count assigned entries rather than its length.
+    const declaredPages = Object.keys(data.pages).length;
+    const maxCharPage = data.chars.reduce((max, c) => Math.max(max, c.page), 0);
+    const pageCount = Math.max(declaredPages, maxCharPage + 1);
+    if (pageCount > 1 || data.chars.some((c) => c.page !== 0)) {
+        throw new Error(`[bmfont] multi-page fonts are not supported (pages=${pageCount})`);
+    }
+
+    requirePositive(data.scaleW, "scaleW");
+    requirePositive(data.scaleH, "scaleH");
+    if (!Number.isFinite(data.lineHeight) || data.lineHeight <= 0) {
+        throw new Error(`[bmfont] lineHeight must be a finite number > 0 (got ${String(data.lineHeight)})`);
+    }
+    if (!Number.isFinite(data.base)) {
+        throw new Error(`[bmfont] base must be a finite number (got ${String(data.base)})`);
+    }
+    if (!Number.isFinite(data.size) || data.size < 0) {
+        throw new Error(`[bmfont] size must be a finite number >= 0 (got ${String(data.size)})`);
+    }
+
+    const size = data.size === 0 ? data.lineHeight : data.size;
+    const baseSize = size * scale;
     const font = new BitmapFont(baseSize, {
         lineHeight: data.lineHeight * scale,
-        // BMFont's base = distance from baseline to line top, used by baselineForCenterY for the conversion
+        // BMFont's base is the distance from the baseline to the line top
         ascent: data.base * scale,
     });
 
     for (const c of data.chars) {
-        // the glyph's rectangle in the **atlas** = font page rectangle + in-page offset
+        // the glyph rectangle in the atlas = font page rectangle + in-page offset
         const rect = {
             x: fontPageRect.x + c.x,
             y: fontPageRect.y + c.y,
             width: c.width,
             height: c.height,
         };
-        // use the shared UV function (it already flips V per the UNPACK_FLIP_Y_WEBGL convention)
         const uv = atlasRectToUV(rect, atlasWidth, atlasHeight);
         const glyph = bMFontGlyphToGlyph(c, data.base, uv);
         // scale affects the font size; scale the metrics by scale (UV stays the same)

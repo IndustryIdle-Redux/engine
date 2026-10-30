@@ -1,21 +1,9 @@
 /**
- * Worldgen -- aligns with `World.generateMap` (`assets/Script/world/World.ts`).
+ * World generation as pure data, aligned with the game's `World.generateMap`.
  *
- * The original's problem: it mixed "generating data" with "creating `cc.Node`" --
- * it ran `new cc.Node().addComponent(cc.Label)` for every tile visited,
- * so a 100×100 map produced **10,000 Label nodes (28.7 MB of heap)** during generation alone,
- * regardless of whether deposits spawned (overlay Labels are created unconditionally).
- *
- * Split apart here:
- *  - **Generation** produces pure data only (`GeneratedWorld`), zero nodes, zero GPU resources
- *  - Rendering is submitted by `Renderer2D` on demand per visible region (overlay text is naturally instantiated only when needed)
- *
- * Generation rules, aligned one by one with the original:
- *  1. `rand = srand(seed)`
- *  2. visit every tile (same order)
- *  3. if the map provides `resourceTiles`: generate only on tiles present in that table; otherwise sample by `resourceProbability`
- *  4. if the tile already has a building and the building is not buildable (`canBuild === false`), skip
- *  5. deposit = `randOne(depositsToArray(map.deposits), () => tileNoise[key] ?? rand())`
+ * Generation produces no nodes and no GPU resources. The RNG call sequence must match the
+ * original: generateWorld consumes `rand()` once per resource-tile decision, so the same seed
+ * yields the same deposit distribution.
  */
 
 import { randOne, srand } from "./rng";
@@ -32,14 +20,11 @@ export interface MapSpec {
     gridType: GridKind;
     /** Tile edge length (for hex, the circumradius) */
     tileSize: number;
-    /**
-     * Probability of each resource tile appearing (0~1).
-     * Original: `if (rand() > map.resourceProbability) return;`
-     */
+    /** Probability of each resource tile appearing (0~1) */
     resourceProbability: number;
-    /** Deposit weight table: deposit type → weight (the game's `map.deposits`, expanded into an array and then sampled) */
+    /** Deposit weight table: deposit type → weight (the game's `map.deposits`) */
     deposits: Record<string, number>;
-    /** Explicit resource tiles (if given, generate **only** on these tiles, ignoring resourceProbability) */
+    /** Explicit resource tiles (if given, generate only on these tiles, ignoring resourceProbability) */
     resourceTiles?: Record<string, true>;
     /** Per-tile noise value (affects deposit type selection; if omitted, the RNG value is used) */
     tileNoise?: Record<string, number>;
@@ -82,10 +67,9 @@ export interface GeneratedWorld {
 }
 
 /**
- * Expand the weight table into an array.
+ * Expand the weight table into an array, repeating each key v times in `forEach` order.
  *
- * Aligns with the game's `depositsToArray`: repeat each key v times in `forEach` order.
- * **Order matters** -- it is the index basis for `randOne`, and changing it changes the deposit distribution.
+ * Order matters: it is the index basis for `randOne`, so changing it changes the distribution.
  */
 export function depositsToArray(deposits: Record<string, number>): string[] {
     const result: string[] = [];
@@ -97,9 +81,9 @@ export function depositsToArray(deposits: Record<string, number>): string[] {
 }
 
 export interface GenerateOptions {
-    /** Existing buildings (key → type); used to skip when "a building occupies the resource tile and is not buildable" */
+    /** Existing buildings (key → type); used to skip tiles occupied by unbuildable buildings */
     buildings?: Record<string, { type: string }>;
-    /** Whether a building is buildable; used to skip tiles occupied by unbuildable buildings (the game's `canBuild`) */
+    /** Whether a building is buildable; when absent, no tile is skipped */
     canBuild?: (type: string) => boolean;
     /** Sandbox mode (original behavior: deposits do not follow the map, the player places them manually) */
     sandbox?: boolean;
@@ -107,11 +91,6 @@ export interface GenerateOptions {
 
 /**
  * Generate the world (pure function, no side effects, no GPU, no nodes).
- *
- * **Note**: to match the original, the RNG call count must be exactly the same as in `generateMap`,
- * otherwise the deposit distribution generated for the same seed differs from the original. So inside the loop
- * `rand()` is called once only when "deciding whether to generate a resource",
- * and `randOne`'s random function is likewise called in the original order.
  */
 export function generateWorld(map: MapSpec, seed: string, options: GenerateOptions = {}): GeneratedWorld {
     const rand = srand(seed);
@@ -126,7 +105,7 @@ export function generateWorld(map: MapSpec, seed: string, options: GenerateOptio
         const key = tileKey(coord);
         const pos = tileToWorld(map.gridType, coord, col, row, map.size, map.tileSize);
 
-        // Every tile is recorded (the original also creates an overlay Label here unconditionally)
+        // Every tile is recorded
         tiles.push({ key, coord, col, row, x: pos.x, y: pos.y });
 
         // 1) Is it a resource tile?
@@ -136,14 +115,14 @@ export function generateWorld(map: MapSpec, seed: string, options: GenerateOptio
             if (rand() > map.resourceProbability) return;
         }
 
-        // 2) Existing building and not buildable → skip
+        // 2) Existing building and not buildable → skip. Without `canBuild` nothing is skipped.
         const b = buildings[key];
         if (b && options.canBuild && !options.canBuild(b.type)) return;
 
         // 3) Sandbox: deposits do not follow the map
         if (options.sandbox) return;
 
-        // 4) Deposit type
+        // 4) Deposit type (undefined only for an empty pool)
         const n = noise[key];
         const type = randOne(depositPool, () => n ?? rand());
         if (type === undefined) return;
@@ -151,9 +130,11 @@ export function generateWorld(map: MapSpec, seed: string, options: GenerateOptio
         deposits.push({ key, coord, type, x: pos.x, y: pos.y });
     });
 
-    // World size: same semantics as the original `grid.getSize()` (including the extra half tile from the first tile's center offset)
+    // World size matches grid.getSize(): hex width has one extra half tile from the staggered
+    // layout, and hex height has one extra half tile above the top row's center.
     const worldWidth = map.gridType === "hex" ? Math.sqrt(3) * map.tileSize * (map.size + 0.5) : map.size * map.tileSize;
-    const worldHeight = map.gridType === "hex" ? map.tileSize * 1.5 * map.size : map.size * map.tileSize;
+    const worldHeight =
+        map.gridType === "hex" ? map.tileSize * 1.5 * map.size + map.tileSize / 2 : map.size * map.tileSize;
 
     return { map, seed, tiles, deposits, worldWidth, worldHeight };
 }

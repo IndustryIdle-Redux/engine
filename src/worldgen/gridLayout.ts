@@ -1,14 +1,8 @@
 /**
- * Map layout -- grid coordinates ↔ world coordinates, covering both map kinds.
+ * Map layout: grid coordinates ↔ world coordinates for both map kinds.
  *
- * This is the shared basis of `World.generateMap` (`Grid.forEach`) and `GridGeometry`:
- * the former decides **each tile's key and position**, the latter decides the **grid lines**. Both must use the same mapping,
- * otherwise deposits get drawn outside their tiles.
- *
- * Alignment evidence:
- *  - Hexagon: `HexagonGrid` uses honeycomb's `rectangle({width,height})`,
- *    tile key = `"${hex.x},${hex.y}"` (axial coordinates, not row/column), position = `toPoint() + center()`
- *  - Square: `SquareGrid` uses `x ∈ [0, maxTile)`, position = `(x*tileSize, y*tileSize)`
+ * `generateWorld` (via `forEachTile`) and `GridGeometry` must use the same mapping, otherwise
+ * deposits are drawn outside their tiles.
  */
 
 import { hexCenter, hexMetrics } from "../renderer/GridGeometry";
@@ -22,17 +16,8 @@ export interface TileCoord {
 }
 
 export function hexOffsetToKey(col: number, row: number): TileCoord {
-    // ⚠️ **This is the offset coordinate itself, do not convert it to axial**.
-    //
-    // For pointy-top hexagons, honeycomb's `Hex.x` / `Hex.y` are exactly the **(column, row)** offset coordinates
-    // (measured: the key set of `rectangle({width:4,height:4})` is the regular `{0..3}×{0..3}`),
-    // and the original `CoreGame/HexagonGrid.ts:31`'s `gridToString(hex)` = `` `${hex.x},${hex.y}` ``
-    // is exactly what it returns.
-    //
-    // This used to be written as `{ x: col - Math.floor(row / 2), y: row }` (**axial q**),
-    // so for row ≥ 2 the engine key and the game key pointed at **different tiles**:
-    // building rendering (`view.tilePosition(key)`), hit-testing, connection lines and transport distance were all shifted by
-    // `floor(row/2)` columns.
+    // Pointy-top honeycomb stores (column,row) in Hex.x/Hex.y, and the game's tile key is
+    // exactly `${hex.x},${hex.y}`; do not convert to axial coordinates.
     return { x: col, y: row };
 }
 
@@ -47,19 +32,10 @@ export function forEachTile(
     maxTile: number,
     visit: (coord: TileCoord, col: number, row: number) => void,
 ): void {
-    // ⚠️ The traversal order **must match the original tile for tile** -- but **hexagons and squares use different orders**!
-    //
-    // In `generateWorld`, `rand()` is **consumed tile by tile**
-    // (`if (rand() > map.resourceProbability) return;`),
-    // so change the order and, for the same `D.seed`, a different set of tiles passes the filter →
-    // **deposit distribution differs from the original → saves are incompatible**. There are two independent sources here; do not assume they unify:
-    //
-    // · **Square**: the original `CoreGame/SquareGrid.ts:13-17` is
-    //     for (x...) for (y...)      → x outer / y inner (**column-major**)
-    //   (`Grid.forEach` uses `for...in`, and keys contain a comma ⇒ V8 preserves insertion order)
-    // · **Hexagon**: the order is decided by honeycomb's `rectangle()`; in practice it runs
-    //     second(r) outer / first(q) inner → **row-major** (axial q increasing)
-    //   see the test case in `tests/worldgen.test.ts` whose "baseline comes from actually running honeycomb".
+    // Traversal order must match the original tile for tile: generateWorld consumes rand()
+    // per tile, so a different order changes the deposit distribution for the same seed.
+    // Square grids are column-major (x outer, y inner); hex grids are row-major, matching
+    // honeycomb's rectangle().
     if (kind === "hex") {
         for (let row = 0; row < maxTile; row++) {
             for (let col = 0; col < maxTile; col++) {
@@ -89,10 +65,8 @@ export function parseTileKey(key: string): TileCoord {
 /**
  * Grid coordinates → world coordinates (pixels).
  *
- * Each map kind's mapping aligns with the original:
- *  - hex: `hexCenter` (aligns with honeycomb)
- *  - square: in `World`, a square tile is positioned at `col*tileSize`, `(maxTile - row)*tileSize`
- *    (the original square map puts the world origin at the bottom-left, with the Y axis pointing up)
+ * Hex positions come from `hexCenter` (aligned with honeycomb); square positions are tile
+ * centers, matching `SquareGrid`'s `(x + 0.5) * tileSize, (y + 0.5) * tileSize`.
  */
 export function tileToWorld(
     kind: GridKind,
@@ -103,24 +77,16 @@ export function tileToWorld(
     tileSize: number,
 ): { x: number; y: number } {
     if (kind === "hex") {
-        // The hexagon key is the (col,row) offset coordinate itself (see `hexOffsetToKey`), so it can be used directly
+        // The hexagon key is the (col,row) offset coordinate itself (see `hexOffsetToKey`)
         void row;
         return hexCenter(coord.x, coord.y, hexMetrics(tileSize));
     }
-    // Square: the **tile center**, not the tile corner
-    //
-    // The original `SquareGrid`'s centers are:
-    //   `centers[`${x},${y}`] = cc.v3((x + 0.5) * tileSize, (y + 0.5) * tileSize)`
-    // i.e. the coordinate maps directly to the world position (no Y flip) and lands on the **tile center**.
-    //
-    // ⚠️ This used to be written as `(col * tileSize, (maxTile - row) * tileSize)`:
-    //   it treated the tile center as the tile corner (half a tile off) and flipped everything vertically (~maxTile tiles off),
-    //   with a measured deviation of up to 4975px (≈100 tiles). Fixed, and locked down by unit tests.
+    // Square: tile center, not tile corner
     void maxTile;
     return { x: (col + 0.5) * tileSize, y: (row + 0.5) * tileSize };
 }
 
-/** World coordinates → nearest tile (for hit-testing; for simplicity it scans candidate rows, O(1) rows) */
+/** World coordinates → nearest tile (for hit-testing; for simplicity it scans candidate rows) */
 export function worldToTile(
     kind: GridKind,
     worldX: number,

@@ -1,17 +1,15 @@
 /**
  * Grid geometry tests.
  *
- * The reference data comes from the output of **actually running the honeycomb library** (`shared/vendor/honeycomb.js`),
- * not from my own derivation -- this way "my implementation draws at the same pixel positions as the original" is locked down.
- *
- * Original reference (size=32, 3×3 rectangular grid):
- *   tile center (row0) = (27.713, 32), row step 48 = 1.5R, odd/even rows staggered by 27.713 = √3R/2
- *   corners() relative to the hex origin = (55.43,16) (55.43,48) (27.71,64) (0,48) (0,16) (27.71,0)
+ * Reference data comes from running the honeycomb library, so "same pixels as the original"
+ * is verified rather than re-derived. For size=32: tile center row 0 = (27.713, 32), row step
+ * 48 = 1.5R, odd/even rows staggered by 27.713 = √3R/2.
  */
 
 import { describe, expect, it } from "vitest";
 import {
     buildHexGridLines,
+    buildHexGridLinesFast,
     buildSquareGridLines,
     gridLineCount,
     hexCenter,
@@ -43,11 +41,7 @@ describe("Pointy-top hexagon geometry (aligns with honeycomb)", () => {
         const r0 = hexCenter(0, 0, m);
         const r1 = hexCenter(0, 1, m);
         const r2 = hexCenter(0, 2, m);
-        // ⚠️ **as row increases, y increases too** (`y = height/2 + row*rowStep`).
-        // This used to assert `r0.y - r1.y === 48` (i.e. y decreasing with row) -- that came from treating
-        // honeycomb's +y as "downward" and negating y, producing a **vertical mirror of the whole map**.
-        // The original uses honeycomb's `toPoint()+center()` directly as world coordinates.
-        // Reference (honeycomb.js actually run, size=32): `"0,1" → y 80`, `"1,2" → y 128`.
+        // Rows increase with y: honeycomb's toPoint()+center() is used directly as world coordinates.
         expect(r1.y - r0.y).toBeCloseTo(48, 9); // 1.5R
         expect(r2.y - r1.y).toBeCloseTo(48, 9);
         // Odd rows shift right by half a tile
@@ -84,7 +78,7 @@ describe("Pointy-top hexagon geometry (aligns with honeycomb)", () => {
 });
 
 describe("Square grid (positions align with the original drawGrid)", () => {
-    it("full map: 2×maxTile lines (the original produces the same count, but strokes them one by one)", () => {
+    it("full map: 2×maxTile lines (deliberately excludes the last row/column boundary)", () => {
         const lines = buildSquareGridLines(10, 50);
         expect(lines).toHaveLength(20); // 10 vertical + 10 horizontal
     });
@@ -107,7 +101,7 @@ describe("Square grid (positions align with the original drawGrid)", () => {
     });
 });
 
-describe("Shared edge dedup (hex's biggest optimization)", () => {
+describe("Shared edge dedup", () => {
     it("full 10×10 map: far fewer edges than \"6 per tile\"", () => {
         const maxTile = 10;
         const naive = maxTile * maxTile * 6;
@@ -130,12 +124,12 @@ describe("Shared edge dedup (hex's biggest optimization)", () => {
         }
     });
 
-    it("full 100×100 map: about 3 edges per tile after dedup (the original is 6 per tile + 10,000 strokes)", () => {
+    it("full 100×100 map: about 3 edges per tile after dedup", () => {
         const lines = buildHexGridLines(100, R);
         const perTile = lines.length / (100 * 100);
         expect(perTile).toBeGreaterThan(2.5);
         expect(perTile).toBeLessThan(3.5);
-        // Versus the original: 60,000 line segments (10,000 tiles × 6 edges, stroked 10,000 times)
+        // Far below the naive 6 edges per tile
         expect(lines.length).toBeLessThan(60000 * 0.6);
     });
 });
@@ -170,5 +164,31 @@ describe("Vertex expansion", () => {
         const lines = buildSquareGridLines(3, 10);
         const reuse = new Float32Array(lines.length * 4);
         expect(linesToVertices(lines, reuse)).toBe(reuse);
+    });
+});
+
+describe("gridLineCount", () => {
+    it("hex counts come from the fast builder the renderer uses", () => {
+        const visible = { x: -400, y: -300, width: 800, height: 600 };
+        expect(gridLineCount("hex", 100, R, visible)).toBe(buildHexGridLinesFast(100, R, visible).length);
+        expect(gridLineCount("hex", 10, R)).toBe(buildHexGridLinesFast(10, R).length);
+    });
+
+    it("square counts match the square builder", () => {
+        expect(gridLineCount("square", 10, 50)).toBe(buildSquareGridLines(10, 50).length);
+    });
+});
+
+describe("Vertex expansion bounds", () => {
+    it("throws a clear error when the external array is too small", () => {
+        const lines = buildSquareGridLines(3, 10);
+        const tooSmall = new Float32Array(lines.length * 4 - 1);
+        expect(() => linesToVertices(lines, tooSmall)).toThrow(/output array too small/);
+    });
+
+    it("accepts an array larger than needed", () => {
+        const lines = buildSquareGridLines(3, 10);
+        const larger = new Float32Array(lines.length * 4 + 8);
+        expect(() => linesToVertices(lines, larger)).not.toThrow();
     });
 });

@@ -174,7 +174,7 @@ describe("Rounded rectangle", () => {
     });
 });
 
-describe("Dashed lines (replaces the cc.Graphics.prototype.dashedLine monkey patch)", () => {
+describe("Dashed lines", () => {
     it("the total dash length ≤ the original length, and stays in bounds", () => {
         const dashes = dashSegment(0, 0, 100, 0, 10, 10);
         let total = 0;
@@ -189,5 +189,11 @@ describe("Dashed lines (replaces the cc.Graphics.prototype.dashedLine monkey pat
 
     it("a zero-length segment returns empty", () => {
         expect(dashSegment(3, 3, 3, 3)).toHaveLength(0);
+    });
+
+    it("non-positive dash/gap totals return empty instead of looping forever", () => {
+        expect(dashSegment(0, 0, 100, 0, 0, 0)).toEqual([]);
+        expect(dashSegment(0, 0, 100, 0, 5, -10)).toEqual([]);
+        expect(dashSegment(0, 0, 100, 0, -5, 10)).toEqual([]);
     });
 });

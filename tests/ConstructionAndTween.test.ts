@@ -1,18 +1,10 @@
 /**
  * Regression tests for two reported bugs:
  *
- * 1. **Coins left on screen** — `TweenManager.update()` used to advance `active` with an index while
- *    completion callbacks can splice that very array (`ResourceAnimation`'s coin chain starts its
- *    flight tween from the scatter tween's `onComplete`, and `to()` supersedes the scatter tween,
- *    which shifts the array). The index-based `splice` then removed a *different*, still-running
- *    tween — so a coin's flight tween could be dropped and its `instances` entry never removed.
- *    The fix walks a snapshot and unlinks by identity.
- *
- * 2. **Construction badge differs from the original** —
- *    - the gear must use `underConstructionColor`/`underConstructionOpacity`
- *      (original: `unpaid` => `color.building` @100, otherwise `color.hq` @255), not the building tint;
- *    - the Level digit must follow the game's `levelVisible` (the original hides it while a building
- *      is under construction), not `level > 0` (a new building already has level 1).
+ * 1. Coins left on screen: a tween's completion callback can create or remove tweens while
+ *    the active list is being walked. The manager walks a snapshot and unlinks by identity.
+ * 2. Construction badge: the gear uses underConstructionColor/underConstructionOpacity, and
+ *    the Level digit follows the game's levelVisible rather than level > 0.
  */
 
 import { describe, expect, it } from "vitest";
