@@ -1,11 +1,8 @@
 /**
- * Public entry point of the in-house rendering engine (de-Cocos).
+ * Public entry point of the engine.
  *
- * Layers:
- *  - **Value types**: Vec2 / Vec3 / Color / Mat3 -- pure data, unit-testable in Node
- *  - **Utilities**: math / log
- *  - **Batch data**: InstanceBuffer -- packing for instanced sprites
- *  - **Renderer**: Renderer2D / SpriteBatch / Camera2D / Texture (requires WebGL2)
+ * Layers: value types, batch data, the renderer facade, grid geometry, bitmap fonts,
+ * asset loading, world generation and the world-layer renderer.
  */
 
 /* ---------------- value types ---------------- */
@@ -24,14 +21,20 @@ export { InstanceBuffer, FLOATS_PER_INSTANCE, INSTANCE_ATTRIBS } from "./Instanc
 export type { SpriteDrawCall } from "./InstanceBuffer";
 
 /* ---------------- renderer ---------------- */
-export { Renderer2D } from "./renderer/Renderer2D";
-export type { RendererOptions } from "./renderer/Renderer2D";
-export { SpriteBatch } from "./renderer/SpriteBatch";
-export { BatchList } from "./renderer/SpriteBatch";
+export { Renderer2D, requestedBackend, webgpuAvailable } from "./renderer/Renderer2D";
+export type { RendererOptions, RendererBackendChoice } from "./renderer/Renderer2D";
+export type {
+    RenderDevice,
+    RenderTexture,
+    Segment,
+    TextureOptions,
+    TextureSource,
+} from "./renderer/RenderDevice";
+export { textureSourceSize, assertTextureSize } from "./renderer/RenderDevice";
+export { SpriteBatch, BatchList } from "./renderer/SpriteBatch";
 export type { Batch } from "./renderer/SpriteBatch";
 export { Camera2D } from "./renderer/Camera2D";
 export { Texture } from "./renderer/Texture";
-export type { TextureOptions } from "./renderer/Texture";
 
 /* ---------------- grid geometry ---------------- */
 export {
@@ -92,14 +95,22 @@ export type { GridKind, TileCoord } from "./worldgen/gridLayout";
 export { generateWorld, placeBuildings, depositsToArray } from "./worldgen/generateWorld";
 export type { MapSpec, GeneratedWorld, Deposit, BuildingPlacement, GenerateOptions } from "./worldgen/generateWorld";
 
-/* ---------------- world-layer renderer (this is the integration point for the game) ---------------- */
+/* ---------------- world-layer renderer (the game integration point) ---------------- */
 export { WorldRenderer, DEFAULT_WORLD_CONFIG } from "./renderer/WorldRenderer";
-export type { WorldRenderConfig, SpriteSource, OverlayValueFn, BuildingVisual } from "./renderer/WorldRenderer";
+export type {
+    WorldRenderConfig,
+    SpriteSource,
+    OverlayValueFn,
+    OverlayTextFn,
+    OverlayText,
+    DepositVisual,
+    BuildingVisual,
+} from "./renderer/WorldRenderer";
 
-/* ---------------- color themes (matching the game's ColorThemes.ts) ---------------- */
-export { THEMES, getTheme, overlayGradient, DEFAULT_THEME_NAME } from "./renderer/Theme";
+/* ---------------- color themes ---------------- */
+export { THEMES, getTheme, cloneTheme, overlayGradient, DEFAULT_THEME_NAME } from "./renderer/Theme";
 export type { IColorTheme } from "./renderer/Theme";
 
-/* ---------------- BMFont (the font format the game actually uses) ---------------- */
+/* ---------------- BMFont ---------------- */
 export { parseBMFont, createBitmapFontFromBMFont, bMFontGlyphToGlyph } from "./renderer/BMFont";
 export type { BMFontData, BMFontChar, FontPageRect } from "./renderer/BMFont";

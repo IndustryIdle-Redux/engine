@@ -46,6 +46,14 @@ renderer.drawLine(0, 0, 100, 100, 2);
 renderer.end();
 ```
 
+## Device lifecycle
+
+`Renderer2D.create()` falls back to WebGL2 when WebGPU cannot be initialized. A GPU device or
+WebGL context can still be lost later (driver reset, tab suspended); while that happens rendering
+is a no-op and `onDeviceLost` fires once. Call `await renderer.recover()` to rebuild the GPU state:
+textures created through the renderer are re-uploaded from their source images. `updateTexture()`
+re-uploads an existing texture in place and `disposeTexture()` releases one.
+
 ## Development
 
 ```bash
