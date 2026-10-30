@@ -1,10 +1,10 @@
 /**
  * Overlay submission structure regression tests.
  *
- * Background: `drawOverlay` used to submit, **per visible tile**, one colour fill (vector layer) and then
- * its text (sprite layer). Both render devices flush their batch whenever the submission kind switches
- * (`WebGL2Device.drawSprite` / `addSprite`, `WebGPUDevice` likewise), so the frame's draw-call count grew
- * linearly with the visible tile count: a 100×100 map at a readable zoom produced one flush pair per tile.
+ * Background: `drawOverlay` submits all colour fills first and then all texts. Interleaving a fill with
+ * its text per tile would switch layers on every tile, and the devices flush their batch on every switch,
+ * so the draw-call count would grow linearly with the visible tile count (a 100×100 map produced one
+ * flush pair per tile).
  *
  * The tests below drive the real `WorldRenderer` through a recording fake renderer that models exactly that
  * flush-on-switch rule, so "draw calls" here means the same thing it means in the device. They also pin the

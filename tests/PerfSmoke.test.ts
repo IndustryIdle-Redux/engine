@@ -1,5 +1,5 @@
 /**
- * Per-frame **work** budgets (perf smoke).
+ * Per-frame work budgets (perf smoke).
  *
  * Why counters instead of wall-clock time: a time assertion is not usable as a CI gate. The same frame
  * measures several times apart between a developer machine and a shared runner, so a time budget either
