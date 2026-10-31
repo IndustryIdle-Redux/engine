@@ -11,7 +11,7 @@ import { Mat3 } from "../src/Mat3";
 import type { SpriteDrawCall } from "../src/InstanceBuffer";
 import { Renderer2D, requestedBackend, webgpuAvailable } from "../src/renderer/Renderer2D";
 import { WebGPUDevice } from "../src/renderer/WebGPUDevice";
-import type { RenderDevice, RenderTexture, Segment } from "../src/renderer/RenderDevice";
+import type { RenderDevice, RenderMesh, RenderTexture, Segment } from "../src/renderer/RenderDevice";
 
 afterEach(() => {
     vi.unstubAllGlobals();
@@ -68,6 +68,11 @@ class FakeDevice implements RenderDevice {
     public drawSprite(_texture: RenderTexture, _call: SpriteDrawCall): void {}
     public addTriangles(_points: readonly number[], _color: Color | undefined, _dx: number, _dy: number): void {}
     public addSegments(_segments: readonly Segment[], _width: number, _color: Color | undefined): void {}
+    public createMesh(vertices: Float32Array): RenderMesh {
+        return { kind: this.kind, vertexCount: vertices.length / 6 };
+    }
+    public drawMesh(_mesh: RenderMesh): void {}
+    public disposeMesh(_mesh: RenderMesh): void {}
     public async recover(): Promise<boolean> {
         return !this.isLost;
     }

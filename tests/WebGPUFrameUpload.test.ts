@@ -12,7 +12,7 @@ import { Mat3 } from "../src/Mat3";
 import { Color } from "../src/Color";
 import { FLOATS_PER_INSTANCE } from "../src/InstanceBuffer";
 import { WebGPUDevice, type WebGPUDeviceOptions } from "../src/renderer/WebGPUDevice";
-import type { RenderTexture } from "../src/renderer/RenderDevice";
+import type { RenderMesh, RenderTexture } from "../src/renderer/RenderDevice";
 import type { SpriteDrawCall } from "../src/InstanceBuffer";
 
 afterEach(() => {
@@ -629,5 +629,75 @@ describe("WebGPUDevice loss and recovery", () => {
         stubGpu(replacement);
         expect(await device.recover()).toBe(false);
         expect(replacement.deviceDestroyed).toBe(1);
+    });
+});
+
+describe("WebGPUDevice static meshes", () => {
+    const triangle = (): Float32Array =>
+        new Float32Array([0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1]);
+
+    it("uploads the mesh once, draws it with the vector pipeline and destroys it on dispose", () => {
+        const { fake, device } = makeDevice({ antialias: false });
+        const buffersBefore = fake.buffers.length;
+        const mesh = device.createMesh(triangle());
+        expect(mesh.kind).toBe("webgpu");
+        expect(mesh.vertexCount).toBe(3);
+        const buffer = fake.buffers[buffersBefore] as FakeBuffer;
+        expect(buffer.usage).toBe(3); // VERTEX | COPY_DST
+        expect(fake.ops.filter((o) => o.kind === "write" && o.buffer === buffer).length).toBe(1);
+
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.drawMesh(mesh);
+        device.endFrame();
+        const draw = fake.ops.find((o) => o.kind === "draw" && o.buffer === buffer);
+        expect(draw?.label).toBe("draw(vectorVertices=3)");
+        expect(draw?.pipeline?.stepMode).toBe("vertex");
+        expect(device.drawCalls).toBe(1);
+        expect(device.triangleCount).toBe(1);
+
+        device.disposeMesh(mesh);
+        expect(buffer.destroyed).toBe(true);
+        expect(() => device.disposeMesh(mesh)).toThrow(/not created by this device/);
+    });
+
+    it("flushes pending vector geometry before the mesh", () => {
+        const { fake, device } = makeDevice({ antialias: false });
+        const mesh = device.createMesh(triangle());
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.addTriangles([0, 0, 1, 0, 0, 1], Color.WHITE, 0, 0);
+        device.drawMesh(mesh);
+        device.endFrame();
+        const draws = fake.ops.filter((o) => o.kind === "draw");
+        expect(draws.length).toBe(2);
+        expect(draws[1]?.label).toBe("draw(vectorVertices=3)");
+    });
+
+    it("re-uploads the mesh after recover()", async () => {
+        const { fake, device } = makeDevice({ antialias: false });
+        const mesh = device.createMesh(triangle());
+        fake.loseDevice();
+        await Promise.resolve();
+        expect(device.isLost).toBe(true);
+        expect(() => device.createMesh(triangle())).toThrow(/lost/);
+
+        const replacement = new FakeGpu();
+        stubGpu(replacement);
+        expect(await device.recover()).toBe(true);
+        const meshBuffer = replacement.buffers.find((b) => b.size === triangle().byteLength);
+        expect(meshBuffer).toBeDefined();
+        expect(replacement.ops.some((o) => o.kind === "write" && o.buffer === meshBuffer)).toBe(true);
+
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.drawMesh(mesh);
+        device.endFrame();
+        expect(replacement.ops.some((o) => o.kind === "draw" && o.buffer === meshBuffer)).toBe(true);
+    });
+
+    it("rejects invalid vertex data and meshes from the other backend", () => {
+        const { device } = makeDevice();
+        expect(() => device.createMesh(new Float32Array(0))).toThrow(/non-empty/);
+        expect(() => device.createMesh(new Float32Array(5))).toThrow(/vertex stride/);
+        const foreign = { kind: "webgl2", vertexCount: 3 } as RenderMesh;
+        expect(() => device.drawMesh(foreign)).toThrow(/webgl2 backend/);
     });
 });

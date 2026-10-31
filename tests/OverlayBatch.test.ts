@@ -107,6 +107,26 @@ function makeRenderer(): FakeRenderer {
             submit("vector");
             segmentColors.push(color);
         },
+        createMesh: (vertices: Float32Array) => {
+            const mesh = { kind: "webgl2" as const, vertexCount: vertices.length / 6, vertices };
+            return mesh;
+        },
+        drawMesh: (mesh: { vertices?: Float32Array }) => {
+            submit("vector");
+            // record the colour baked into the first vertex (the mesh is static, so this is the grid colour)
+            const v = mesh.vertices;
+            if (v && v.length >= 6) {
+                segmentColors.push(
+                    new Color(
+                        Math.round((v[2] as number) * 255),
+                        Math.round((v[3] as number) * 255),
+                        Math.round((v[4] as number) * 255),
+                        Math.round((v[5] as number) * 255),
+                    ),
+                );
+            }
+        },
+        disposeMesh: () => {},
         getVisibleRect: (out?: { x: number; y: number; width: number; height: number }) => camera.getVisibleRect(out),
     } as unknown as Renderer2D;
 

@@ -13,9 +13,17 @@ import { GraphicsBatch } from "./GraphicsBatch";
 import { SpriteBatch } from "./SpriteBatch";
 import { Texture } from "./Texture";
 import { assertTextureSize } from "./RenderDevice";
-import type { RenderDevice, RenderTexture, Segment, TextureOptions } from "./RenderDevice";
+import type { RenderDevice, RenderMesh, RenderTexture, Segment, TextureOptions } from "./RenderDevice";
 
 type Layer = "sprite" | "vector" | null;
+
+interface WebGLMesh extends RenderMesh {
+    kind: "webgl2";
+    vertexCount: number;
+    buffer: WebGLBuffer;
+    /** Retained so the buffer can be re-uploaded after a context restore. */
+    source: Float32Array;
+}
 
 export class WebGL2Device implements RenderDevice {
     public readonly kind = "webgl2" as const;
@@ -28,10 +36,14 @@ export class WebGL2Device implements RenderDevice {
     private projection = new Mat3();
     private layer: Layer = null;
     private totals = { drawCalls: 0, instances: 0, triangles: 0 };
+    /** Triangles already counted from the dynamic vector batch this frame. */
+    private uploadedVectorTriangles = 0;
     private lost = false;
     private disposed = false;
     /** Textures created by this device, kept so they can be re-uploaded after a context restore. */
     private readonly textures = new Set<Texture>();
+    /** Static meshes created by this device (buffers are invalid after a context restore). */
+    private readonly meshes = new Set<WebGLMesh>();
 
     private readonly handleContextLost = (event: Event): void => {
         event.preventDefault();
@@ -46,6 +58,7 @@ export class WebGL2Device implements RenderDevice {
         try {
             this.createResources();
             for (const texture of this.textures) texture.reload(this.gl);
+            for (const mesh of this.meshes) mesh.buffer = this.graphics.uploadMesh(mesh.source);
             this.lost = false;
         } catch {
             // Stay lost; recover() reports false and the caller can recreate the device.
@@ -95,6 +108,7 @@ export class WebGL2Device implements RenderDevice {
         gl.clear(gl.COLOR_BUFFER_BIT);
         this.projection.copyFrom(projection);
         this.totals = { drawCalls: 0, instances: 0, triangles: 0 };
+        this.uploadedVectorTriangles = 0;
         this.batch.begin();
         this.batch.setProjection(projection);
         this.graphics.begin();
@@ -135,7 +149,9 @@ export class WebGL2Device implements RenderDevice {
         this.batch.setStraightBlend();
         this.graphics.flush(this.projection);
         this.totals.drawCalls += this.graphics.drawCalls;
-        this.totals.triangles = this.graphics.triangleCount;
+        const total = this.graphics.triangleCount;
+        this.totals.triangles += total - this.uploadedVectorTriangles;
+        this.uploadedVectorTriangles = total;
     }
 
     public createTexture(image: TexImageSource, width: number, height: number, options: TextureOptions = {}): RenderTexture {
@@ -173,6 +189,47 @@ export class WebGL2Device implements RenderDevice {
             throw new Error("[renderer] texture was not created by this device");
         }
         return texture;
+    }
+
+    public createMesh(vertices: Float32Array): RenderMesh {
+        if (this.disposed) throw new Error("[renderer] device has been disposed");
+        if (this.lost) throw new Error("[renderer] device is lost");
+        const mesh: WebGLMesh = {
+            kind: "webgl2",
+            vertexCount: vertices.length / 6,
+            buffer: this.graphics.uploadMesh(vertices),
+            source: vertices,
+        };
+        this.meshes.add(mesh);
+        return mesh;
+    }
+
+    public drawMesh(mesh: RenderMesh): void {
+        if (this.lost) return;
+        const owned = this.ownedMesh(mesh);
+        if (this.layer === "sprite") this.flushSprites();
+        if (this.layer === "vector" && this.graphics.pendingVertices > 0) this.flushVectors();
+        this.batch.setStraightBlend();
+        this.graphics.drawMesh(owned.buffer, owned.vertexCount, this.projection);
+        this.totals.drawCalls++;
+        this.totals.triangles += owned.vertexCount / 3;
+        this.layer = "vector";
+    }
+
+    public disposeMesh(mesh: RenderMesh): void {
+        const owned = this.ownedMesh(mesh);
+        this.meshes.delete(owned);
+        this.graphics.deleteMesh(owned.buffer);
+    }
+
+    private ownedMesh(mesh: RenderMesh): WebGLMesh {
+        if (mesh.kind !== this.kind) {
+            throw new Error(`[renderer] mesh belongs to the ${mesh.kind} backend, not webgl2`);
+        }
+        if (!this.meshes.has(mesh as WebGLMesh)) {
+            throw new Error("[renderer] mesh was not created by this device");
+        }
+        return mesh as WebGLMesh;
     }
 
     public drawSprite(texture: RenderTexture, call: SpriteDrawCall): void {
@@ -214,6 +271,8 @@ export class WebGL2Device implements RenderDevice {
         }
         for (const texture of this.textures) texture.dispose(this.gl);
         this.textures.clear();
+        for (const mesh of this.meshes) this.graphics.deleteMesh(mesh.buffer);
+        this.meshes.clear();
         this.batch.dispose();
         this.graphics.dispose();
         this.layer = null;

@@ -25,6 +25,7 @@ export { Renderer2D, requestedBackend, webgpuAvailable } from "./renderer/Render
 export type { RendererOptions, RendererBackendChoice } from "./renderer/Renderer2D";
 export type {
     RenderDevice,
+    RenderMesh,
     RenderTexture,
     Segment,
     TextureOptions,

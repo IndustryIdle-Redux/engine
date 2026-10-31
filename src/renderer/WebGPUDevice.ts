@@ -16,11 +16,10 @@ import type { Mat3 } from "../Mat3";
 import { BatchList, type Batch } from "./SpriteBatch";
 import { InstanceBuffer, INSTANCE_ATTRIBS, FLOATS_PER_INSTANCE, type SpriteDrawCall } from "../InstanceBuffer";
 import { assertTextureSize } from "./RenderDevice";
-import type { RenderDevice, RenderTexture, Segment, TextureOptions, TextureSource } from "./RenderDevice";
+import type { RenderDevice, RenderMesh, RenderTexture, Segment, TextureOptions, TextureSource } from "./RenderDevice";
+import { FLOATS_PER_VERTEX, writeSegmentVertices } from "./vertexLayout";
 
 type Layer = "sprite" | "vector" | null;
-
-const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
 
 export interface WebGPUDeviceOptions {
     alpha?: boolean;
@@ -44,6 +43,20 @@ class GpuTexture implements RenderTexture {
         this.width = source.width;
         this.height = source.height;
         this.premultiplied = source.options.premultiplyAlpha === true;
+    }
+}
+
+class GpuMesh implements RenderMesh {
+    public readonly kind = "webgpu" as const;
+    public vertexCount: number;
+    public buffer: GPUBuffer;
+    /** Retained so the buffer can be re-uploaded after device recovery. */
+    public readonly source: Float32Array;
+
+    constructor(buffer: GPUBuffer, source: Float32Array) {
+        this.buffer = buffer;
+        this.source = source;
+        this.vertexCount = source.length / FLOATS_PER_VERTEX;
     }
 }
 
@@ -180,6 +193,7 @@ export class WebGPUDevice implements RenderDevice {
     private msaaHeight = 0;
 
     private readonly textures = new Set<GpuTexture>();
+    private readonly meshes = new Set<GpuMesh>();
 
     private constructor(
         device: GPUDevice,
@@ -480,6 +494,9 @@ export class WebGPUDevice implements RenderDevice {
             texture.bindGroup = null;
             this.uploadTexture(texture);
         }
+        for (const mesh of this.meshes) {
+            mesh.buffer = this.createMeshBuffer(mesh.source);
+        }
         this.resetFrameState();
         this.lost = false;
         return true;
@@ -767,6 +784,59 @@ export class WebGPUDevice implements RenderDevice {
         return texture;
     }
 
+    /* ---------------- meshes ---------------- */
+
+    private createMeshBuffer(vertices: Float32Array): GPUBuffer {
+        const buffer = this.device.createBuffer({
+            size: Math.max(4, vertices.byteLength),
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+        if (vertices.byteLength > 0) this.device.queue.writeBuffer(buffer, 0, vertices);
+        return buffer;
+    }
+
+    public createMesh(vertices: Float32Array): RenderMesh {
+        if (this.disposed) throw new Error("[renderer] device has been disposed");
+        if (this.lost) throw new Error("[renderer] device is lost");
+        if (vertices.length === 0 || vertices.length % FLOATS_PER_VERTEX !== 0) {
+            throw new Error("[renderer] mesh vertex data must be a non-empty multiple of the vertex stride");
+        }
+        const mesh = new GpuMesh(this.createMeshBuffer(vertices), vertices);
+        this.meshes.add(mesh);
+        return mesh;
+    }
+
+    public drawMesh(mesh: RenderMesh): void {
+        if (this.lost) return;
+        const owned = this.ownedMesh(mesh);
+        if (this.layer === "sprite") this.flushSprites();
+        if (this.layer === "vector") this.flushVectors();
+        if (!this.pass) throw new Error("[renderer] drawMesh called outside a frame");
+        this.pass.setPipeline(this.vectorPipeline);
+        this.pass.setBindGroup(0, this.vectorBindGroup);
+        this.pass.setVertexBuffer(0, owned.buffer);
+        this.pass.draw(owned.vertexCount, 1);
+        this.totals.drawCalls++;
+        this.totals.triangles += owned.vertexCount / 3;
+        this.layer = "vector";
+    }
+
+    public disposeMesh(mesh: RenderMesh): void {
+        const owned = this.ownedMesh(mesh);
+        this.meshes.delete(owned);
+        owned.buffer.destroy();
+    }
+
+    private ownedMesh(mesh: RenderMesh): GpuMesh {
+        if (mesh.kind !== this.kind) {
+            throw new Error(`[renderer] mesh belongs to the ${mesh.kind} backend, not webgpu`);
+        }
+        if (!(mesh instanceof GpuMesh) || !this.meshes.has(mesh)) {
+            throw new Error("[renderer] mesh was not created by this device");
+        }
+        return mesh;
+    }
+
     /** Sampler for a texture-option set; defaults match WebGL's linear + clamp-to-edge. */
     private samplerFor(options: TextureOptions): GPUSampler {
         const linear = options.linear !== false;
@@ -829,40 +899,8 @@ export class WebGPUDevice implements RenderDevice {
         if (this.layer === "sprite") this.flushSprites();
         this.layer = "vector";
         this.ensureVectorCapacity(segments.length * 6);
-        const d = this.vectorData;
-        const half = width / 2;
-        const r = color ? color.r / 255 : 1;
-        const g = color ? color.g / 255 : 1;
-        const b = color ? color.b / 255 : 1;
-        const a = color ? color.a / 255 : 1;
-        let o = this.vectorVertices * FLOATS_PER_VERTEX;
-        for (const s of segments) {
-            const dx = s.x1 - s.x0;
-            const dy = s.y1 - s.y0;
-            const len = Math.hypot(dx, dy);
-            if (len < 1e-9) continue;
-            const nx = (-dy / len) * half;
-            const ny = (dx / len) * half;
-            const x0n = s.x0 + nx;
-            const y0n = s.y0 + ny;
-            const x1n = s.x1 + nx;
-            const y1n = s.y1 + ny;
-            const x0p = s.x0 - nx;
-            const y0p = s.y0 - ny;
-            const x1p = s.x1 - nx;
-            const y1p = s.y1 - ny;
-            // two triangles per segment
-            const verts = [x0n, y0n, x1n, y1n, x0p, y0p, x0p, y0p, x1n, y1n, x1p, y1p];
-            for (let i = 0; i < 6; i++) {
-                d[o++] = verts[i * 2] as number;
-                d[o++] = verts[i * 2 + 1] as number;
-                d[o++] = r;
-                d[o++] = g;
-                d[o++] = b;
-                d[o++] = a;
-            }
-            this.vectorVertices += 6;
-        }
+        const written = writeSegmentVertices(segments, width, color, this.vectorData, this.vectorVertices);
+        this.vectorVertices += written;
     }
 
     private ensureVectorCapacity(vertices: number): void {
@@ -880,6 +918,8 @@ export class WebGPUDevice implements RenderDevice {
         this.disposed = true;
         for (const texture of this.textures) texture.texture.destroy();
         this.textures.clear();
+        for (const mesh of this.meshes) mesh.buffer.destroy();
+        this.meshes.clear();
         this.releaseMsaa();
         this.instanceBuffer.destroy();
         this.vectorBuffer.destroy();

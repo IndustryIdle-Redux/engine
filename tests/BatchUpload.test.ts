@@ -15,7 +15,7 @@ import { Color } from "../src/Color";
 import { FLOATS_PER_INSTANCE, INSTANCE_ATTRIBS } from "../src/InstanceBuffer";
 import { WebGL2Device } from "../src/renderer/WebGL2Device";
 import { Texture } from "../src/renderer/Texture";
-import type { RenderTexture } from "../src/renderer/RenderDevice";
+import type { RenderMesh, RenderTexture } from "../src/renderer/RenderDevice";
 
 /* ------------------------------------------------------------------ *
  * Recording fake WebGL2 context
@@ -69,6 +69,11 @@ class FakeGL {
     public readonly COMPILE_STATUS = 0x8b81;
     public readonly LINK_STATUS = 0x8b82;
     public readonly DYNAMIC_DRAW = 0x88e8;
+    public readonly STATIC_DRAW = 0x88e4;
+    /** usage argument of every `bufferData` call, in order */
+    public readonly bufferDataUsage: unknown[] = [];
+    /** ids of buffers deleted via `deleteBuffer`, in order */
+    public readonly deletedBuffers: number[] = [];
     public readonly TEXTURE_2D = 0x0de1;
     public readonly DEPTH_TEST = 0x0b71;
     public readonly BLEND = 0x0be2;
@@ -148,7 +153,9 @@ class FakeGL {
     }
     public texParameteri(): void {}
     public pixelStorei(): void {}
-    public deleteBuffer(): void {}
+    public deleteBuffer(buffer: { id: number }): void {
+        this.deletedBuffers.push(buffer.id);
+    }
     public deleteVertexArray(): void {}
     public deleteProgram(): void {}
     public disable(): void {}
@@ -160,8 +167,9 @@ class FakeGL {
     public clearColor(): void {}
     public clear(): void {}
 
-    public bufferData(_target: number, dataOrSize: ArrayBufferView | number): void {
+    public bufferData(_target: number, dataOrSize: ArrayBufferView | number, usage?: unknown): void {
         this.bufferDataCalls++;
+        this.bufferDataUsage.push(usage);
         const sizeHint = typeof dataOrSize === "number";
         this.uploads.push({
             buffer: this.boundBuffer,
@@ -418,5 +426,75 @@ describe("WebGL2 context loss", () => {
         gl.canvas.dispatchEvent(new Event("webglcontextlost", { cancelable: true }));
         expect(lostCalls).toBe(0);
         expect(device.isLost).toBe(false);
+    });
+});
+
+describe("WebGL2 static meshes", () => {
+    /** three vertices = one triangle */
+    const triangle = (): Float32Array =>
+        new Float32Array([0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1]);
+
+    it("uploads the mesh once with STATIC_DRAW and draws it with the vector program", () => {
+        const { gl, device } = makeDevice();
+        const payloadsBefore = gl.payloads.length;
+        const mesh = device.createMesh(triangle());
+        expect(mesh.kind).toBe("webgl2");
+        expect(mesh.vertexCount).toBe(3);
+        expect(gl.payloads.length).toBe(payloadsBefore + 1);
+        expect(gl.bufferDataUsage[gl.bufferDataUsage.length - 1]).toBe(gl.STATIC_DRAW);
+
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.drawMesh(mesh);
+        device.endFrame();
+        expect(gl.vertexDraws[gl.vertexDraws.length - 1]).toBe(3);
+        expect(device.drawCalls).toBe(1);
+        expect(device.triangleCount).toBe(1);
+
+        device.disposeMesh(mesh);
+        expect(gl.deletedBuffers.length).toBe(1);
+        expect(() => device.disposeMesh(mesh)).toThrow(/not created by this device/);
+    });
+
+    it("flushes pending vector geometry before the mesh so draw order is preserved", () => {
+        const { gl, device } = makeDevice();
+        const mesh = device.createMesh(triangle());
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.addTriangles([0, 0, 1, 0, 0, 1], Color.WHITE, 0, 0);
+        device.drawMesh(mesh);
+        device.endFrame();
+
+        expect(gl.vertexDraws.slice(-2)).toEqual([3, 3]);
+        expect(device.drawCalls).toBe(2);
+    });
+
+    it("re-uploads the mesh after a context restore", () => {
+        const { gl, device } = makeDevice();
+        const mesh = device.createMesh(triangle());
+
+        gl.canvas.dispatchEvent(new Event("webglcontextlost", { cancelable: true }));
+        expect(device.isLost).toBe(true);
+        const uploadsBefore = gl.payloads.length;
+        gl.canvas.dispatchEvent(new Event("webglcontextrestored"));
+        expect(device.isLost).toBe(false);
+        // the restored GL context needs the static mesh uploaded again
+        expect(gl.payloads.length).toBe(uploadsBefore + 1);
+        expect(gl.payloads[gl.payloads.length - 1]?.size).toBe(triangle().byteLength);
+
+        device.beginFrame(new Color(0, 0, 0, 255), new Mat3());
+        device.drawMesh(mesh);
+        device.endFrame();
+        expect(gl.vertexDraws[gl.vertexDraws.length - 1]).toBe(3);
+    });
+
+    it("rejects a mesh from the other backend", () => {
+        const { device } = makeDevice();
+        const foreign = { kind: "webgpu", vertexCount: 3 } as RenderMesh;
+        expect(() => device.drawMesh(foreign)).toThrow(/webgpu backend/);
+        expect(() => device.disposeMesh(foreign)).toThrow(/webgpu backend/);
+    });
+
+    it("rejects mesh data that is not a multiple of the vertex stride", () => {
+        const { device } = makeDevice();
+        expect(() => device.createMesh(new Float32Array(5))).toThrow(/vertex stride/);
     });
 });

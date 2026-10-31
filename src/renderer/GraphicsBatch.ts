@@ -8,6 +8,9 @@
 
 import { Color } from "../Color";
 import { Mat3 } from "../Mat3";
+import { FLOATS_PER_VERTEX, writeSegmentVertices } from "./vertexLayout";
+
+export { FLOATS_PER_VERTEX } from "./vertexLayout";
 
 const VERTEX_SHADER = `#version 300 es
 precision highp float;
@@ -36,8 +39,6 @@ void main() {
     fragColor = v_color;
 }
 `;
-
-export const FLOATS_PER_VERTEX = 6;
 
 export { VERTEX_SHADER as GRAPHICS_VERTEX_SHADER, FRAGMENT_SHADER as GRAPHICS_FRAGMENT_SHADER };
 
@@ -206,49 +207,7 @@ export class GraphicsBatch {
         if (segments.length === 0 || width <= 0) return;
         // Reserve by the upper bound; degenerate segments are skipped and write fewer vertices.
         this.ensureVertices(segments.length * 6);
-        const d = this.data;
-        const half = width / 2;
-        const r = color ? color.r / 255 : 1;
-        const g = color ? color.g / 255 : 1;
-        const b = color ? color.b / 255 : 1;
-        const a = color ? color.a / 255 : 1;
-        let o = this.vertexCount * FLOATS_PER_VERTEX;
-        let written = 0;
-
-        const put = (x: number, y: number): void => {
-            d[o++] = x;
-            d[o++] = y;
-            d[o++] = r;
-            d[o++] = g;
-            d[o++] = b;
-            d[o++] = a;
-            written++;
-        };
-
-        for (let i = 0; i < segments.length; i++) {
-            const s = segments[i] as { x0: number; y0: number; x1: number; y1: number };
-            const dx = s.x1 - s.x0;
-            const dy = s.y1 - s.y0;
-            const len = Math.hypot(dx, dy);
-            if (len < 1e-9) continue;
-            const nx = (-dy / len) * half;
-            const ny = (dx / len) * half;
-            const ax0 = s.x0 + nx;
-            const ay0 = s.y0 + ny;
-            const ax1 = s.x0 - nx;
-            const ay1 = s.y0 - ny;
-            const bx0 = s.x1 + nx;
-            const by0 = s.y1 + ny;
-            const bx1 = s.x1 - nx;
-            const by1 = s.y1 - ny;
-            // two triangles
-            put(ax0, ay0);
-            put(bx0, by0);
-            put(ax1, ay1);
-            put(ax1, ay1);
-            put(bx0, by0);
-            put(bx1, by1);
-        }
+        const written = writeSegmentVertices(segments, width, color, this.data, this.vertexCount);
         this.vertexCount += written;
     }
 
@@ -265,9 +224,12 @@ export class GraphicsBatch {
         projection.toMat3Array(this.projectionArray);
         gl.uniformMatrix3fv(this.uProjection, false, this.projectionArray);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo);
+        // Re-point the attributes: a static mesh draw may have left them bound to its own buffer.
+        const stride = FLOATS_PER_VERTEX * 4;
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, stride, 0);
+        gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 2 * 4);
         // Grow the store only when the frame outgrows it; otherwise each flush is a plain
         // `bufferSubData` into a disjoint range (see `uploaded`).
-        const stride = FLOATS_PER_VERTEX * 4;
         const needed = this.vertexCount * stride;
         if (needed > this.glCapacityBytes) {
             let cap = Math.max(4096 * FLOATS_PER_VERTEX, this.glCapacityBytes);
@@ -287,6 +249,41 @@ export class GraphicsBatch {
         gl.bindVertexArray(null);
         gl.bindBuffer(gl.ARRAY_BUFFER, null);
         this.uploaded = this.vertexCount;
+    }
+
+    /** Upload a static triangle mesh (interleaved `x, y, r, g, b, a`) and return its GL buffer. */
+    public uploadMesh(vertices: Float32Array): WebGLBuffer {
+        if (vertices.length % FLOATS_PER_VERTEX !== 0) {
+            throw new Error("[graphics] mesh vertex data is not a multiple of the vertex stride");
+        }
+        const gl = this.gl;
+        const buffer = gl.createBuffer();
+        if (!buffer) throw new Error("[graphics] createBuffer failed");
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        return buffer;
+    }
+
+    /** Draw a mesh uploaded by `uploadMesh`. Re-binds the attribute pointers to the mesh's buffer. */
+    public drawMesh(buffer: WebGLBuffer, vertexCount: number, projection: Mat3): void {
+        if (vertexCount <= 0) return;
+        const gl = this.gl;
+        gl.useProgram(this.program);
+        gl.bindVertexArray(this.vao);
+        projection.toMat3Array(this.projectionArray);
+        gl.uniformMatrix3fv(this.uProjection, false, this.projectionArray);
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        const stride = FLOATS_PER_VERTEX * 4;
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, stride, 0);
+        gl.vertexAttribPointer(1, 4, gl.FLOAT, false, stride, 2 * 4);
+        gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+        gl.bindVertexArray(null);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    }
+
+    public deleteMesh(buffer: WebGLBuffer): void {
+        this.gl.deleteBuffer(buffer);
     }
 
     /** Number of triangles submitted this frame */

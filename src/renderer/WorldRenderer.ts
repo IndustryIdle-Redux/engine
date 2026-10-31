@@ -23,9 +23,10 @@ import {
 import type { LineSegment } from "./GridGeometry";
 import type { Renderer2D } from "./Renderer2D";
 import type { BitmapFont, LaidOutGlyph } from "./BitmapFont";
-import type { RenderTexture } from "./RenderDevice";
+import type { RenderMesh, RenderTexture } from "./RenderDevice";
 import type { SpriteDrawCall } from "../InstanceBuffer";
 import { warn } from "../log";
+import { FLOATS_PER_VERTEX, writeSegmentVertices } from "./vertexLayout";
 
 /* ------------------------------------------------------------------ *
  * Sprite source: name -> atlas UV + size + texture
@@ -237,6 +238,9 @@ export class WorldRenderer {
     private gridCacheKey = "";
     /** Cache hit/miss stats */
     public readonly gridCacheStats = { hit: 0, miss: 0 };
+    /** Uploaded grid mesh for the current rect + line width + colour. */
+    private gridMesh: RenderMesh | null = null;
+    private gridMeshKey = "";
 
     /** Reused visible-rect object for the tile bounds */
     private readonly visibleRect = { x: 0, y: 0, width: 0, height: 0 };
@@ -314,6 +318,14 @@ export class WorldRenderer {
         if (patch.theme) this.config.theme = cloneTheme(patch.theme);
     }
 
+    /** Release the cached grid mesh; call it when this world renderer is discarded. */
+    public dispose(): void {
+        if (this.gridMesh) this.renderer.disposeMesh(this.gridMesh);
+        this.gridMesh = null;
+        this.gridMeshKey = "";
+        this.gridCacheKey = "";
+    }
+
     /* ---------------- resolved colors ---------------- */
 
     private gridColor(): Color {
@@ -351,6 +363,7 @@ export class WorldRenderer {
         this.stats.selected = 0;
         this.stats.missingSprites = 0;
         if (!this.config.showGrid) return;
+        if (this.renderer.isLost) return;
         const visible = this.renderer.getVisibleRect();
         const { gridKind, maxTile, tileSize } = this.config;
 
@@ -376,9 +389,19 @@ export class WorldRenderer {
             this.gridCacheStats.hit++;
         }
 
-        // Line width follows the original's LINE_WIDTH / sqrt(zoom).
+        // Line width follows the original's LINE_WIDTH / sqrt(zoom). The uploaded mesh is keyed by
+        // rect + width + colour, so a still camera draws it without expanding or uploading again.
         const width = this.config.lineWidth / Math.sqrt(this.renderer.camera.zoom);
-        this.renderer.drawSegments(this.gridLines, width, this.gridColor());
+        const color = this.gridColor();
+        const meshKey = `${key}|${width.toFixed(3)}|${color.r},${color.g},${color.b},${color.a}`;
+        if (this.gridMesh === null || meshKey !== this.gridMeshKey) {
+            if (this.gridMesh) this.renderer.disposeMesh(this.gridMesh);
+            const data = new Float32Array(this.gridLines.length * 6 * FLOATS_PER_VERTEX);
+            const written = writeSegmentVertices(this.gridLines, width, color, data);
+            this.gridMesh = written > 0 ? this.renderer.createMesh(data.subarray(0, written * FLOATS_PER_VERTEX)) : null;
+            this.gridMeshKey = meshKey;
+        }
+        if (this.gridMesh) this.renderer.drawMesh(this.gridMesh);
         this.stats.gridLines = this.gridLines.length;
     }
 

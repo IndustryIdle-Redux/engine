@@ -14,7 +14,7 @@ import type { SpriteDrawCall } from "../src/InstanceBuffer";
 import { BatchList, FRAGMENT_SHADER_SOURCE, VERTEX_SHADER_SOURCE } from "../src/renderer/SpriteBatch";
 import type { Texture } from "../src/renderer/Texture";
 import { Renderer2D } from "../src/renderer/Renderer2D";
-import type { RenderDevice, RenderTexture, Segment, TextureOptions } from "../src/renderer/RenderDevice";
+import type { RenderDevice, RenderMesh, RenderTexture, Segment, TextureOptions } from "../src/renderer/RenderDevice";
 
 afterEach(() => {
     vi.unstubAllGlobals();
@@ -169,6 +169,23 @@ class FakeDevice implements RenderDevice {
         this.segmentCalls++;
     }
 
+    public readonly meshes: Float32Array[] = [];
+    public meshDraws = 0;
+    public disposedMeshes = 0;
+
+    public createMesh(vertices: Float32Array): RenderMesh {
+        this.meshes.push(vertices);
+        return { kind: this.kind, vertexCount: vertices.length / 6 };
+    }
+
+    public drawMesh(_mesh: RenderMesh): void {
+        this.meshDraws++;
+    }
+
+    public disposeMesh(_mesh: RenderMesh): void {
+        this.disposedMeshes++;
+    }
+
     public async recover(): Promise<boolean> {
         return !this.isLost;
     }
@@ -306,5 +323,30 @@ describe("Renderer2D texture lifetime", () => {
         expect(device.spriteCount).toBe(0);
         expect(device.segmentCalls).toBe(0);
         expect(() => renderer.createTexture({} as TexImageSource, 1, 1)).toThrow(/disposed/);
+    });
+});
+
+describe("Renderer2D meshes", () => {
+    it("passes meshes through and guards lost/disposed states", () => {
+        const { renderer, device } = makeRenderer();
+        const mesh = renderer.createMesh(new Float32Array(18));
+        expect(device.meshes.length).toBe(1);
+        expect(mesh.vertexCount).toBe(3);
+
+        renderer.drawMesh(mesh);
+        expect(device.meshDraws).toBe(1);
+
+        device.isLost = true;
+        renderer.drawMesh(mesh);
+        expect(device.meshDraws).toBe(1);
+
+        device.isLost = false;
+        renderer.disposeMesh(mesh);
+        expect(device.disposedMeshes).toBe(1);
+
+        renderer.dispose();
+        expect(() => renderer.createMesh(new Float32Array(18))).toThrow(/disposed/);
+        renderer.disposeMesh(mesh);
+        expect(device.disposedMeshes).toBe(1);
     });
 });

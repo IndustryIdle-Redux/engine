@@ -130,6 +130,9 @@ function makeRenderer(): FakeRenderer {
         fillRegularPolygon: () => submit("vector"),
         strokePolyline: () => submit("vector"),
         drawSegments: () => submit("vector"),
+        createMesh: (vertices: Float32Array) => ({ kind: "webgl2" as const, vertexCount: vertices.length / 6 }),
+        drawMesh: () => submit("vector"),
+        disposeMesh: () => {},
         getVisibleRect: (out?: { x: number; y: number; width: number; height: number }) => camera.getVisibleRect(out),
     } as unknown as Renderer2D;
 

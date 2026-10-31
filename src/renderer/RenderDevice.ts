@@ -20,6 +20,16 @@ export interface RenderTexture {
     readonly premultiplied: boolean;
 }
 
+/**
+ * Static triangle mesh: interleaved `x, y, r, g, b, a` vertices, uploaded once and drawn with the
+ * vector pipeline. Use it for geometry that is rebuilt rarely (map grid lines, cached overlays).
+ */
+export interface RenderMesh {
+    readonly kind: "webgl2" | "webgpu";
+    readonly vertexCount: number;
+}
+
+
 export interface TextureOptions {
     /** Linear filtering; set false for pixel-art textures. */
     linear?: boolean;
@@ -123,6 +133,12 @@ export interface RenderDevice {
     ): void;
 
     disposeTexture(texture: RenderTexture): void;
+
+    /** Upload a static triangle mesh; the data is interleaved `x, y, r, g, b, a`. */
+    createMesh(vertices: Float32Array): RenderMesh;
+    /** Draw a mesh in the vector layer, flushing pending batches first to preserve call order. */
+    drawMesh(mesh: RenderMesh): void;
+    disposeMesh(mesh: RenderMesh): void;
 
     /* ---- textured sprite layer (buildings / deposits / dots / glyphs) ---- */
     drawSprite(texture: RenderTexture, call: SpriteDrawCall): void;

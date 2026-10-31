@@ -9,7 +9,7 @@
 import { Color } from "../Color";
 import { Camera2D } from "./Camera2D";
 import type { SpriteDrawCall } from "../InstanceBuffer";
-import type { RenderDevice, RenderTexture, TextureOptions } from "./RenderDevice";
+import type { RenderDevice, RenderMesh, RenderTexture, TextureOptions } from "./RenderDevice";
 import { WebGL2Device } from "./WebGL2Device";
 import { WebGPUDevice } from "./WebGPUDevice";
 import { circlePath, regularPolygonPath, roundedRectPath, strokePolyline, triangulatePolygon } from "./tessellate";
@@ -253,6 +253,25 @@ export class Renderer2D {
     ): void {
         if (this.disposed || this.device.isLost) return;
         this.device.addSegments(segments, width, color);
+    }
+
+    /**
+     * Upload a static triangle mesh (interleaved `x, y, r, g, b, a`) for geometry that changes
+     * rarely, such as the map grid. Draw it with `drawMesh`; release it with `disposeMesh`.
+     */
+    public createMesh(vertices: Float32Array): RenderMesh {
+        if (this.disposed) throw new Error("[renderer] renderer has been disposed");
+        return this.device.createMesh(vertices);
+    }
+
+    public drawMesh(mesh: RenderMesh): void {
+        if (this.disposed || this.device.isLost) return;
+        this.device.drawMesh(mesh);
+    }
+
+    public disposeMesh(mesh: RenderMesh): void {
+        if (this.disposed) return;
+        this.device.disposeMesh(mesh);
     }
 
     /** Stroke a polyline */
