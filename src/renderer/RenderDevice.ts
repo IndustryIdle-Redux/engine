@@ -102,6 +102,7 @@ export function assertTextureSize(image: TexImageSource, width: number, height: 
 }
 
 export interface RenderDevice {
+    /** Which backend this device drives; asset code uses it for backend-specific upload rules. */
     readonly kind: "webgl2" | "webgpu";
 
     /** True after the GPU device or the WebGL2 context has been lost. */

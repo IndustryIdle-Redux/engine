@@ -160,11 +160,20 @@ export class Loader {
         return res.text();
     }
 
-    /** Decode an image URL into a texture through the device seam. */
+    /**
+     * Decode an image URL into a texture through the device seam.
+     *
+     * Both backends upload images flipped vertically (WebGL sets `UNPACK_FLIP_Y`,
+     * WebGPU passes `flipY` to `copyExternalImageToTexture`), which is what
+     * `atlasRectToUV()` assumes. However the WebGL spec says `UNPACK_FLIP_Y_WEBGL`
+     * is **ignored for `ImageBitmap` sources**, so a bitmap would arrive unflipped
+     * there while WebGPU does flip it. WebGL2 therefore decodes through an
+     * `HTMLImageElement`; WebGPU keeps the off-thread bitmap decode.
+     */
     public async texture(device: RenderDevice, path: string): Promise<RenderTexture> {
         const url = this.url(path);
 
-        if (typeof createImageBitmap === "function") {
+        if (device.kind !== "webgl2" && typeof createImageBitmap === "function") {
             const res = await this.fetchImpl(url);
             if (!res.ok) throw new Error(`[loader] load failed ${path}: HTTP ${res.status}`);
             const blob = await res.blob();
@@ -265,6 +274,7 @@ function validateAtlasManifest(value: unknown): AtlasManifest {
 }
 
 /** Extracted so tests can swap it (Blob also works in Node) */
+
 function bitmapSource(blob: Blob): ImageBitmapSource {
     return blob as unknown as ImageBitmapSource;
 }

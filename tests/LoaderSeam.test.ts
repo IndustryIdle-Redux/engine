@@ -100,6 +100,49 @@ describe("Loader uses the render-device seam", () => {
         expect(bitmap.close).toHaveBeenCalledTimes(1);
     });
 
+    it("decodes with an image element on the WebGL2 backend", async () => {
+        // WebGL ignores UNPACK_FLIP_Y for ImageBitmap, so this backend must not use one.
+        const createBitmap = vi.fn();
+        vi.stubGlobal("createImageBitmap", createBitmap);
+        const images: FakeImage[] = [];
+        class FakeImage {
+            naturalWidth = 32;
+            naturalHeight = 16;
+            crossOrigin = "";
+            onload: (() => void) | null = null;
+            onerror: (() => void) | null = null;
+            private _src = "";
+            constructor() {
+                images.push(this);
+            }
+            get src(): string {
+                return this._src;
+            }
+            set src(value: string) {
+                this._src = value;
+                queueMicrotask(() => this.onload?.());
+            }
+        }
+        vi.stubGlobal("Image", FakeImage);
+
+        const recorded: Recorded[] = [];
+        const device = {
+            kind: "webgl2",
+            createTexture: (image: TexImageSource, width: number, height: number): RenderTexture => {
+                recorded.push({ image, width, height, options: undefined });
+                return { kind: "webgl2", width, height, premultiplied: false } as RenderTexture;
+            },
+        } as unknown as RenderDevice;
+        const loader = new Loader({ basePath: "/assets/" });
+
+        await loader.texture(device, "atlas.png");
+
+        expect(createBitmap).not.toHaveBeenCalled();
+        expect(recorded[0]?.width).toBe(32);
+        expect(recorded[0]?.height).toBe(16);
+        expect(recorded[0]?.image).toBe(images[0]);
+    });
+
     it("builds an atlas whose texture is the device-created one", async () => {
         const bitmap = { width: 128, height: 128, close: vi.fn() };
         vi.stubGlobal("createImageBitmap", vi.fn(async () => bitmap));
