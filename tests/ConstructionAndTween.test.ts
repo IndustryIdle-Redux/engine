@@ -190,6 +190,17 @@ describe("drawBuildings: construction badge follows the original", () => {
     });
 });
 
+describe("drawBuildings: body sprite", () => {
+    it("rotates the body by spriteRotation (attacking buildings spin their turret)", () => {
+        const { world, drawn } = makeWorldRenderer();
+        world.drawBuildings({
+            buildings: [underConstructionBuilding({ underConstruction: false, levelVisible: false, spriteRotation: Math.PI / 3 })],
+        });
+        const body = drawn.find((d) => d.name === "CoalMine");
+        expect(body?.rotation).toBeCloseTo(Math.PI / 3, 9);
+    });
+});
+
 describe("drawBuildings: node state follows the original (recipe icon / ring mirroring)", () => {
     it("fades the recipe icon with recipeOpacity (original tweens recipeSprite.node.opacity)", () => {
         const { world, drawn } = makeWorldRenderer();

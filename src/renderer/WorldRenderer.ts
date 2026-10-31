@@ -581,6 +581,8 @@ export class WorldRenderer {
                 color: b.color ?? this.buildingColor(),
                 // Under construction the body is semi-transparent (the original uses opacity 100).
                 opacity: b.underConstruction ? 100 : (b.spriteOpacity ?? 255),
+                // An attacking building's sprite spins (the original rotated the node while firing).
+                rotation: b.spriteRotation ?? 0,
             });
         }
 
@@ -1008,6 +1010,8 @@ export interface BuildingVisual {
     underConstructionOpacity?: number;
     /** whether the level node is active (false while under construction) */
     levelVisible?: boolean;
+    /** body sprite rotation in radians (attacking buildings spin their turret) */
+    spriteRotation?: number;
     /** recipe icon opacity */
     recipeOpacity?: number;
     /** ring node `scaleX`; negative mirrors the arc */
